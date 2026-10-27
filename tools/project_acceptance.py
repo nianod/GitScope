@@ -1,9 +1,3 @@
-"""Project/repository acceptance gates for Repo_analysis_tool.
-
-This module intentionally keeps fact collection separate from policy decisions.
-The analyzer produces a report, this module normalizes it and evaluates the
-configured repository and project requirements.
-"""
 
 from __future__ import annotations
 
@@ -14,7 +8,6 @@ import os
 import re
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
-
 
 DEFAULT_POLICY: Dict[str, Any] = {
     "repository_rules": {
@@ -35,8 +28,16 @@ DEFAULT_POLICY: Dict[str, Any] = {
 }
 
 BOT_PATTERNS = (
-    "[bot]", "dependabot", "renovate", "github-actions", "gitlab-ci",
-    "jenkins", "buildkite", "circleci", "travis", "automation",
+    "[bot]",
+    "dependabot",
+    "renovate",
+    "github-actions",
+    "gitlab-ci",
+    "jenkins",
+    "buildkite",
+    "circleci",
+    "travis",
+    "automation",
 )
 
 
@@ -90,15 +91,30 @@ def load_projects_csv(path: str) -> List[Dict[str, Any]]:
     with open(path, "r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         headers = {str(h).strip().lower() for h in (reader.fieldnames or [])}
-        target_column = "repo_url" if "repo_url" in headers else "repo_path" if "repo_path" in headers else None
-        if "project_name" not in headers or not target_column or "branch" not in headers:
-            raise ValueError("CSV must contain project_name, repo_url, and branch columns")
+        target_column = (
+            "repo_url"
+            if "repo_url" in headers
+            else "repo_path" if "repo_path" in headers else None
+        )
+        if (
+            "project_name" not in headers
+            or not target_column
+            or "branch" not in headers
+        ):
+            raise ValueError(
+                "CSV must contain project_name, repo_url, and branch columns"
+            )
 
-        
         for row_number, raw_row in enumerate(reader, start=2):
-            row = {str(k).strip().lower(): (v or "").strip() for k, v in raw_row.items() if k is not None}
+            row = {
+                str(k).strip().lower(): (v or "").strip()
+                for k, v in raw_row.items()
+                if k is not None
+            }
             project_name = row.get("project_name", "")
-            target = (row.get("repo_url") or row.get("repo_path") or "").strip().strip('"')
+            target = (
+                (row.get("repo_url") or row.get("repo_path") or "").strip().strip('"')
+            )
             branch = row.get("branch", "").strip().strip('"')
             if not project_name:
                 errors.append(f"Row {row_number}: project_name is missing")
@@ -107,19 +123,25 @@ def load_projects_csv(path: str) -> List[Dict[str, Any]]:
                 errors.append(f"Row {row_number}: repo_url is missing")
                 continue
             if not branch:
-                errors.append(f"Row {row_number}: branch name is missing; please mention the branch name")
+                errors.append(
+                    f"Row {row_number}: branch name is missing; please mention the branch name"
+                )
                 continue
             target_key = target.rstrip("/\\").lower()
             if target_key in seen_targets:
                 errors.append(f"Row {row_number}: duplicate repository '{target}'")
                 continue
             seen_targets.add(target_key)
-            project = projects.setdefault(project_name, {"name": project_name, "repositories": []})
-            project["repositories"].append({
-                "name": derive_repo_name(target),
-                "target": target,
-                "branch": branch,
-            })
+            project = projects.setdefault(
+                project_name, {"name": project_name, "repositories": []}
+            )
+            project["repositories"].append(
+                {
+                    "name": derive_repo_name(target),
+                    "target": target,
+                    "branch": branch,
+                }
+            )
 
     if errors:
         raise ValueError("Invalid projects CSV:\n  " + "\n  ".join(errors))
@@ -132,7 +154,9 @@ def create_projects_csv_wizard(output_path: str = "projects.csv") -> str:
     """Collect one or more projects interactively and save a reusable CSV."""
     rows: List[Tuple[str, str, str]] = []
     print("\nProject Input Wizard")
-    print("Enter one or more projects. Each project may contain one or more repositories.\n")
+    print(
+        "Enter one or more projects. Each project may contain one or more repositories.\n"
+    )
     while True:
         project_name = input("Project name: ").strip()
         if not project_name:
@@ -149,7 +173,11 @@ def create_projects_csv_wizard(output_path: str = "projects.csv") -> str:
                     break
                 print("[!] Branch name is required. Please mention the branch name.")
             rows.append((project_name, target, branch))
-            more_repos = input(f"Add another repository to '{project_name}'? [y/N]: ").strip().lower()
+            more_repos = (
+                input(f"Add another repository to '{project_name}'? [y/N]: ")
+                .strip()
+                .lower()
+            )
             if more_repos not in {"y", "yes"}:
                 break
         more_projects = input("Add another project? [y/N]: ").strip().lower()
@@ -193,27 +221,45 @@ def normalize_repository_metrics(report: Dict[str, Any]) -> Dict[str, Any]:
     compliance = tool_metrics.get("compliance", {}) or {}
     license_file = compliance.get("license_file")
     license_type = compliance.get("license_type")
-    license_detected = bool(
-        license_file or license_type or compliance.get("is_open_source") is True
-    ) if compliance_available else None
+    license_detected = (
+        bool(license_file or license_type or compliance.get("is_open_source") is True)
+        if compliance_available
+        else None
+    )
     structure = report.get("heuristics", {}).get("structure", {})
     repo_path = report.get("target_path", "")
     readme_name, readme_characters = _root_readme(repo_path)
 
     contributors = git.get("all_contributors", []) or []
     human_contributors = [c for c in contributors if not _is_bot(c)]
-    
-    human_count = len(human_contributors) if contributors else git.get("unique_contributors")
+
+    human_count = (
+        len(human_contributors) if contributors else git.get("unique_contributors")
+    )
 
     language_breakdown = gt.get("languages", {}).get("breakdown", {}) or {}
     non_core = {
-        "JSON", "XML", "YAML", "CSV", "TOML", "INI", "Markdown", "Text",
-        "reStructuredText", "TeX", "SVG", "Properties", "Dockerfile",
+        "JSON",
+        "XML",
+        "YAML",
+        "CSV",
+        "TOML",
+        "INI",
+        "Markdown",
+        "Text",
+        "reStructuredText",
+        "TeX",
+        "SVG",
+        "Properties",
+        "Dockerfile",
     }
     loc_source = gt.get("loc", {}).get("source")
-    eligible_loc = int(gt.get("loc", {}).get("breakdown", {}).get(
-        "authored", gt.get("loc", {}).get("value", 0)
-    ) or 0)
+    eligible_loc = int(
+        gt.get("loc", {})
+        .get("breakdown", {})
+        .get("authored", gt.get("loc", {}).get("value", 0))
+        or 0
+    )
     if not eligible_loc and language_breakdown:
         eligible_loc = sum(
             int(stats.get("loc", 0) or 0)
@@ -221,20 +267,41 @@ def normalize_repository_metrics(report: Dict[str, Any]) -> Dict[str, Any]:
             if language not in non_core
         )
 
-    visibility_available = bool(api.get("available")) and isinstance(api.get("is_private"), bool)
+    visibility_available = bool(api.get("available")) and isinstance(
+        api.get("is_private"), bool
+    )
     pr_available = bool(prs.get("github_pr_analysis_available"))
     git_available = bool(git.get("available", report.get("is_git", False)))
     loc_available = loc_source == "scc"
 
-    
-    
     extensions = structure.get("extensions", {}) or {}
     non_source_exts = {
-        ".md", ".markdown", ".rst", ".txt", ".adoc", ".tex", ".json",
-        ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml",
-        ".csv", ".tsv", ".dat", ".lock", ".excluded", ".unknown",
+        ".md",
+        ".markdown",
+        ".rst",
+        ".txt",
+        ".adoc",
+        ".tex",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".xml",
+        ".csv",
+        ".tsv",
+        ".dat",
+        ".lock",
+        ".excluded",
+        ".unknown",
     }
-    eligible_files = sum(int(count or 0) for ext, count in extensions.items() if ext not in non_source_exts)
+    eligible_files = sum(
+        int(count or 0)
+        for ext, count in extensions.items()
+        if ext not in non_source_exts
+    )
 
     return {
         "repository_name": report.get("repo"),
@@ -252,7 +319,11 @@ def normalize_repository_metrics(report: Dict[str, Any]) -> Dict[str, Any]:
         "default_branch": git.get("default_branch"),
         "analysis_branch": git.get("analysis_branch"),
         "branch_selection_source": git.get("branch_selection_source"),
-        "git_history_intact": git.get("history_integrity", {}).get("appears_intact") if git_available else None,
+        "git_history_intact": (
+            git.get("history_integrity", {}).get("appears_intact")
+            if git_available
+            else None
+        ),
         "eligible_source_file_count": eligible_files,
         "human_contributor_count": human_count if git_available else None,
         "merged_pr_count": prs.get("merged_pr_count") if pr_available else None,
@@ -261,11 +332,15 @@ def normalize_repository_metrics(report: Dict[str, Any]) -> Dict[str, Any]:
         "blacklist_status": prs.get("blacklist_status") if pr_available else None,
         "commit_count": git.get("commit_count") if git_available else None,
         "eligible_source_loc": eligible_loc if loc_available else None,
-        "development_span_months": git.get("active_span_months") if git_available else None,
+        "development_span_months": (
+            git.get("active_span_months") if git_available else None
+        ),
     }
 
 
-def _check(rule_id: str, actual: Any, expected: str, passed: Optional[bool], reason: str) -> Dict[str, Any]:
+def _check(
+    rule_id: str, actual: Any, expected: str, passed: Optional[bool], reason: str
+) -> Dict[str, Any]:
     return {
         "rule_id": rule_id,
         "status": "UNKNOWN" if passed is None else "PASS" if passed else "FAIL",
@@ -275,34 +350,94 @@ def _check(rule_id: str, actual: Any, expected: str, passed: Optional[bool], rea
     }
 
 
-def evaluate_repository(metrics: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:
+def evaluate_repository(
+    metrics: Dict[str, Any], policy: Dict[str, Any]
+) -> Dict[str, Any]:
     rules = policy["repository_rules"]
     readme_chars = metrics.get("readme_characters")
     min_readme = int(rules["readme_minimum_characters"])
     checks = []
     if rules.get("private_required", True):
-        checks.append(_check("private_repository", metrics.get("is_private"), "private", None if not metrics.get("visibility_available") else metrics.get("is_private") is True, "Repository visibility must be verified as private"))
+        checks.append(
+            _check(
+                "private_repository",
+                metrics.get("is_private"),
+                "private",
+                (
+                    None
+                    if not metrics.get("visibility_available")
+                    else metrics.get("is_private") is True
+                ),
+                "Repository visibility must be verified as private",
+            )
+        )
     if rules.get("license_absent_required", True):
         license_actual = {
             "detected": metrics.get("license_detected"),
             "file": metrics.get("license_file"),
             "type": metrics.get("license_type"),
         }
-        checks.append(_check(
-            "no_detected_license",
-            license_actual,
-            "no license detected",
-            None if not metrics.get("license_detection_available") else metrics.get("license_detected") is False,
-            "Any detected license makes the repository ineligible",
-        ))
+        checks.append(
+            _check(
+                "no_detected_license",
+                license_actual,
+                "no license detected",
+                (
+                    None
+                    if not metrics.get("license_detection_available")
+                    else metrics.get("license_detected") is False
+                ),
+                "Any detected license makes the repository ineligible",
+            )
+        )
     if rules.get("readme_required", True):
-        checks.append(_check("valid_root_readme", readme_chars, f">= {min_readme} characters", False if readme_chars is None else readme_chars >= min_readme, "A meaningful README is required at repository root"))
+        checks.append(
+            _check(
+                "valid_root_readme",
+                readme_chars,
+                f">= {min_readme} characters",
+                False if readme_chars is None else readme_chars >= min_readme,
+                "A meaningful README is required at repository root",
+            )
+        )
     if rules.get("git_history_intact_required", True):
-        checks.append(_check("git_history_intact", metrics.get("git_history_intact"), "true", None if not metrics.get("git_available") else metrics.get("git_history_intact") is True, "Git history must be intact"))
-    checks.extend([
-        _check("eligible_source_files", metrics.get("eligible_source_file_count"), f">= {rules['minimum_eligible_source_files']}", metrics.get("eligible_source_file_count", 0) >= int(rules["minimum_eligible_source_files"]), "Minimum eligible source-file count"),
-        _check("human_contributors", metrics.get("human_contributor_count"), f">= {rules['minimum_human_contributors']}", None if metrics.get("human_contributor_count") is None else metrics["human_contributor_count"] >= int(rules["minimum_human_contributors"]), "Minimum unique human contributors"),
-    ])
+        checks.append(
+            _check(
+                "git_history_intact",
+                metrics.get("git_history_intact"),
+                "true",
+                (
+                    None
+                    if not metrics.get("git_available")
+                    else metrics.get("git_history_intact") is True
+                ),
+                "Git history must be intact",
+            )
+        )
+    checks.extend(
+        [
+            _check(
+                "eligible_source_files",
+                metrics.get("eligible_source_file_count"),
+                f">= {rules['minimum_eligible_source_files']}",
+                metrics.get("eligible_source_file_count", 0)
+                >= int(rules["minimum_eligible_source_files"]),
+                "Minimum eligible source-file count",
+            ),
+            _check(
+                "human_contributors",
+                metrics.get("human_contributor_count"),
+                f">= {rules['minimum_human_contributors']}",
+                (
+                    None
+                    if metrics.get("human_contributor_count") is None
+                    else metrics["human_contributor_count"]
+                    >= int(rules["minimum_human_contributors"])
+                ),
+                "Minimum unique human contributors",
+            ),
+        ]
+    )
     if any(c["status"] == "FAIL" for c in checks):
         decision = "REJECT"
     elif any(c["status"] == "UNKNOWN" for c in checks):
@@ -312,19 +447,35 @@ def evaluate_repository(metrics: Dict[str, Any], policy: Dict[str, Any]) -> Dict
     return {"decision": decision, "checks": checks}
 
 
-def _any_repo_check(repositories: List[Dict[str, Any]], rule_id: str, expected: str, predicate, values) -> Dict[str, Any]:
+def _any_repo_check(
+    repositories: List[Dict[str, Any]], rule_id: str, expected: str, predicate, values
+) -> Dict[str, Any]:
     for repo in repositories:
         value = values(repo["metrics"])
         if value is not None and predicate(repo["metrics"]):
-            result = _check(rule_id, value, expected, True, f"Satisfied by {repo['name']}")
+            result = _check(
+                rule_id, value, expected, True, f"Satisfied by {repo['name']}"
+            )
             result["satisfied_by"] = repo["name"]
             return result
-    known = [values(repo["metrics"]) for repo in repositories if values(repo["metrics"]) is not None]
+    known = [
+        values(repo["metrics"])
+        for repo in repositories
+        if values(repo["metrics"]) is not None
+    ]
     unknown_exists = len(known) != len(repositories)
-    return _check(rule_id, known, expected, None if unknown_exists else False, "No repository could be verified as satisfying this rule")
+    return _check(
+        rule_id,
+        known,
+        expected,
+        None if unknown_exists else False,
+        "No repository could be verified as satisfying this rule",
+    )
 
 
-def evaluate_project(project: Dict[str, Any], repositories: List[Dict[str, Any]], policy: Dict[str, Any]) -> Dict[str, Any]:
+def evaluate_project(
+    project: Dict[str, Any], repositories: List[Dict[str, Any]], policy: Dict[str, Any]
+) -> Dict[str, Any]:
     rules = policy["project_rules"]
     min_prs = int(rules["minimum_merged_prs"])
     min_commits = int(rules["minimum_commits_same_repository"])
@@ -333,26 +484,40 @@ def evaluate_project(project: Dict[str, Any], repositories: List[Dict[str, Any]]
 
     checks = [
         _any_repo_check(
-            repositories, "merged_prs_and_commits_same_repository",
+            repositories,
+            "merged_prs_and_commits_same_repository",
             f"merged PRs >= {min_prs} AND commits >= {min_commits}",
-            lambda m: m.get("merged_pr_count", -1) >= min_prs and m.get("commit_count", -1) >= min_commits,
-            lambda m: None if m.get("merged_pr_count") is None or m.get("commit_count") is None else {"merged_prs": m["merged_pr_count"], "commits": m["commit_count"]},
+            lambda m: m.get("merged_pr_count", -1) >= min_prs
+            and m.get("commit_count", -1) >= min_commits,
+            lambda m: (
+                None
+                if m.get("merged_pr_count") is None or m.get("commit_count") is None
+                else {"merged_prs": m["merged_pr_count"], "commits": m["commit_count"]}
+            ),
         ),
         _any_repo_check(
-            repositories, "minimum_eligible_source_loc", f">= {min_loc}",
+            repositories,
+            "minimum_eligible_source_loc",
+            f">= {min_loc}",
             lambda m: m.get("eligible_source_loc", -1) >= min_loc,
             lambda m: m.get("eligible_source_loc"),
         ),
         _any_repo_check(
-            repositories, "minimum_development_span_months", f">= {min_span:g} months",
+            repositories,
+            "minimum_development_span_months",
+            f">= {min_span:g} months",
             lambda m: m.get("development_span_months", -1) >= min_span,
             lambda m: m.get("development_span_months"),
         ),
     ]
 
-    if any(repo["decision"] == "REJECT" for repo in repositories) or any(c["status"] == "FAIL" for c in checks):
+    if any(repo["decision"] == "REJECT" for repo in repositories) or any(
+        c["status"] == "FAIL" for c in checks
+    ):
         decision = "REJECT"
-    elif any(repo["decision"] in {"MANUAL_REVIEW", "ANALYSIS_ERROR"} for repo in repositories) or any(c["status"] == "UNKNOWN" for c in checks):
+    elif any(
+        repo["decision"] in {"MANUAL_REVIEW", "ANALYSIS_ERROR"} for repo in repositories
+    ) or any(c["status"] == "UNKNOWN" for c in checks):
         decision = "MANUAL_REVIEW"
     else:
         decision = "ACCEPT"
@@ -380,7 +545,9 @@ def _short_check_reason(check: Dict[str, Any]) -> str:
         "minimum_eligible_source_loc": "No repo meets minimum eligible source LOC",
         "minimum_development_span_months": "No repo meets minimum development span",
     }
-    label = rule_labels.get(check.get("rule_id"), check.get("rule_id", "Requirement failed"))
+    label = rule_labels.get(
+        check.get("rule_id"), check.get("rule_id", "Requirement failed")
+    )
     actual = check.get("actual")
     expected = check.get("expected")
     if check.get("status") == "UNKNOWN":
@@ -399,9 +566,7 @@ def update_legacy_acceptance(output_dir: str, project_result: Dict[str, Any]) ->
         reader = csv.DictReader(handle)
         rows = list(reader)
         fieldnames = list(reader.fieldnames or [])
-    
-    
-    
+
     for column in reversed(["pr_velocity_profile", "blacklist_status"]):
         if column not in fieldnames:
             if "Acceptance Decision" in fieldnames:
@@ -421,7 +586,9 @@ def update_legacy_acceptance(output_dir: str, project_result: Dict[str, Any]) ->
     repo_lookup: Dict[str, Dict[str, Any]] = {}
     for repo in project_result.get("repository_results", []):
         names = {str(repo.get("name", "")).strip().lower()}
-        analyzed_name = str(repo.get("metrics", {}).get("repository_name", "")).strip().lower()
+        analyzed_name = (
+            str(repo.get("metrics", {}).get("repository_name", "")).strip().lower()
+        )
         if analyzed_name:
             names.add(analyzed_name)
         for name in names:
@@ -429,7 +596,8 @@ def update_legacy_acceptance(output_dir: str, project_result: Dict[str, Any]) ->
                 repo_lookup[name] = repo
 
     project_problem_checks = [
-        check for check in project_result.get("project_checks", [])
+        check
+        for check in project_result.get("project_checks", [])
         if check.get("status") in {"FAIL", "UNKNOWN"}
     ]
     project_reasons = [_short_check_reason(check) for check in project_problem_checks]
@@ -439,7 +607,8 @@ def update_legacy_acceptance(output_dir: str, project_result: Dict[str, Any]) ->
         if not repo:
             continue
         repo_problem_checks = [
-            check for check in repo.get("checks", [])
+            check
+            for check in repo.get("checks", [])
             if check.get("status") in {"FAIL", "UNKNOWN"}
         ]
         reasons = [_short_check_reason(check) for check in repo_problem_checks]
@@ -448,16 +617,24 @@ def update_legacy_acceptance(output_dir: str, project_result: Dict[str, Any]) ->
             reasons.insert(0, repo.get("error", "Repository analysis failed"))
 
         metrics = repo.get("metrics", {})
-        row["pr_velocity_profile"] = row.get("pr_velocity_profile") or metrics.get("pr_velocity_profile", "N/A")
-        row["blacklist_status"] = row.get("blacklist_status") or metrics.get("blacklist_status", "N/A")
+        row["pr_velocity_profile"] = row.get("pr_velocity_profile") or metrics.get(
+            "pr_velocity_profile", "N/A"
+        )
+        row["blacklist_status"] = row.get("blacklist_status") or metrics.get(
+            "blacklist_status", "N/A"
+        )
         row["Acceptance Decision"] = (
             f"Repository: {repo.get('decision', 'ANALYSIS_ERROR')} | "
             f"Project: {project_result.get('decision', 'MANUAL_REVIEW')}"
         )
-        
-        project_part = row["Acceptance Decision"].split("Project:")[-1].strip().split()[0]
+
+        project_part = (
+            row["Acceptance Decision"].split("Project:")[-1].strip().split()[0]
+        )
         row["Status"] = project_part
-        row["Rejection Reason"] = "; ".join(reasons) if reasons else "All requirements passed"
+        row["Rejection Reason"] = (
+            "; ".join(reasons) if reasons else "All requirements passed"
+        )
 
     temp_path = f"{path}.tmp"
     with open(temp_path, "w", encoding="utf-8-sig", newline="") as handle:
@@ -497,7 +674,9 @@ def save_combined_legacy(
                 str(repo.get("name", "")).strip().lower(),
                 str(repo.get("metrics", {}).get("repository_name", "")).strip().lower(),
             ]
-            legacy_row = next((legacy_by_repo[name] for name in names if name in legacy_by_repo), None)
+            legacy_row = next(
+                (legacy_by_repo[name] for name in names if name in legacy_by_repo), None
+            )
             if legacy_row is None:
                 metrics = repo.get("metrics", {})
                 legacy_row = {
@@ -507,7 +686,9 @@ def save_combined_legacy(
                         f"Repository: {repo.get('decision', 'ANALYSIS_ERROR')} | "
                         f"Project: {project_result.get('decision', 'MANUAL_REVIEW')}"
                     ),
-                    "Rejection Reason": repo.get("error", "Repository analysis did not complete"),
+                    "Rejection Reason": repo.get(
+                        "error", "Repository analysis did not complete"
+                    ),
                     "pr_velocity_profile": metrics.get("pr_velocity_profile", "N/A"),
                     "blacklist_status": metrics.get("blacklist_status", "N/A"),
                 }
@@ -515,14 +696,15 @@ def save_combined_legacy(
                     if header not in fieldnames:
                         fieldnames.append(header)
 
-            combined_rows.append({
-                "Project Name": project_result.get("project_name", ""),
-                "Repository Target": repo.get("target", ""),
-                "Requested Branch": repo.get("branch") or "",
-                **legacy_row,
-            })
+            combined_rows.append(
+                {
+                    "Project Name": project_result.get("project_name", ""),
+                    "Repository Target": repo.get("target", ""),
+                    "Requested Branch": repo.get("branch") or "",
+                    **legacy_row,
+                }
+            )
 
-    
     def _ensure_column_before(fieldnames, col, before_col):
         if col not in fieldnames or before_col not in fieldnames:
             return fieldnames
@@ -536,7 +718,9 @@ def save_combined_legacy(
 
     fieldnames = _ensure_column_before(fieldnames, "Status", "Acceptance Decision")
     fieldnames = _ensure_column_before(fieldnames, "blacklist_status", "Status")
-    fieldnames = _ensure_column_before(fieldnames, "pr_velocity_profile", "blacklist_status")
+    fieldnames = _ensure_column_before(
+        fieldnames, "pr_velocity_profile", "blacklist_status"
+    )
 
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, "combined_legacy.csv")
@@ -549,38 +733,73 @@ def save_combined_legacy(
     return path
 
 
-def save_portfolio_results(project_results: List[Dict[str, Any]], output_dir: str) -> Dict[str, str]:
+def save_portfolio_results(
+    project_results: List[Dict[str, Any]], output_dir: str
+) -> Dict[str, str]:
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    overall = "REJECT" if any(p["decision"] == "REJECT" for p in project_results) else "MANUAL_REVIEW" if any(p["decision"] != "ACCEPT" for p in project_results) else "ACCEPT"
-    portfolio = {"generated_at": datetime.datetime.now().isoformat(timespec="seconds"), "decision": overall, "projects": project_results}
+    overall = (
+        "REJECT"
+        if any(p["decision"] == "REJECT" for p in project_results)
+        else (
+            "MANUAL_REVIEW"
+            if any(p["decision"] != "ACCEPT" for p in project_results)
+            else "ACCEPT"
+        )
+    )
+    portfolio = {
+        "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "decision": overall,
+        "projects": project_results,
+    }
     json_path = os.path.join(output_dir, f"portfolio_decision_{timestamp}.json")
     csv_path = os.path.join(output_dir, f"portfolio_summary_{timestamp}.csv")
     with open(json_path, "w", encoding="utf-8") as handle:
         json.dump(portfolio, handle, indent=2, ensure_ascii=False)
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as handle:
-        fieldnames = ["project_name", "project_decision", "repository_name", "repository_decision", "failed_rules", "unknown_rules"]
+        fieldnames = [
+            "project_name",
+            "project_decision",
+            "repository_name",
+            "repository_decision",
+            "failed_rules",
+            "unknown_rules",
+        ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for project in project_results:
             for repo in project["repository_results"]:
-                writer.writerow({
-                    "project_name": project["project_name"],
-                    "project_decision": project["decision"],
-                    "repository_name": repo["name"],
-                    "repository_decision": repo["decision"],
-                    "failed_rules": " | ".join(c["rule_id"] for c in repo.get("checks", []) if c["status"] == "FAIL"),
-                    "unknown_rules": " | ".join(c["rule_id"] for c in repo.get("checks", []) if c["status"] == "UNKNOWN"),
-                })
+                writer.writerow(
+                    {
+                        "project_name": project["project_name"],
+                        "project_decision": project["decision"],
+                        "repository_name": repo["name"],
+                        "repository_decision": repo["decision"],
+                        "failed_rules": " | ".join(
+                            c["rule_id"]
+                            for c in repo.get("checks", [])
+                            if c["status"] == "FAIL"
+                        ),
+                        "unknown_rules": " | ".join(
+                            c["rule_id"]
+                            for c in repo.get("checks", [])
+                            if c["status"] == "UNKNOWN"
+                        ),
+                    }
+                )
     return {"decision": overall, "json": json_path, "csv": csv_path}
 
 
-def print_portfolio_summary(project_results: List[Dict[str, Any]], saved: Dict[str, str]) -> None:
+def print_portfolio_summary(
+    project_results: List[Dict[str, Any]], saved: Dict[str, str]
+) -> None:
     print("\n" + "=" * 62)
     print(f"PORTFOLIO DECISION: {saved['decision']}")
     print("=" * 62)
     for project in project_results:
-        print(f"{project['project_name']}: {project['decision']} ({project['repositories_analyzed']} repositories)")
+        print(
+            f"{project['project_name']}: {project['decision']} ({project['repositories_analyzed']} repositories)"
+        )
         for repo in project["repository_results"]:
             print(f"  - {repo['name']}: {repo['decision']}")
         for check in project["project_checks"]:
