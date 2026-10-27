@@ -6144,7 +6144,7 @@ def _safeOutputName(value: str) -> str:
 
 def runProjectsAnalysis(args: argparse.Namespace) -> str:
     """Analyze and evaluate all projects declared in a user-friendly CSV."""
-    from project_acceptance import (
+    from tools.project_acceptance import (
         evaluate_project,
         evaluate_repository,
         load_policy,
@@ -6334,7 +6334,7 @@ Examples:
             args.input = args.input.strip().strip('"')
 
         if args.project_wizard:
-            from project_acceptance import create_projects_csv_wizard, load_projects_csv
+            from tools.project_acceptance import create_projects_csv_wizard, load_projects_csv
             args.projects = create_projects_csv_wizard(args.wizard_output)
             wizard_projects = load_projects_csv(args.projects)
             wizard_repo_count = sum(len(p["repositories"]) for p in wizard_projects)
