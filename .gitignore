@@ -1,0 +1,9 @@
+cloned_repos/
+outputs/
+download/
+__pycache__/
+*.csv
+!projects.example.csv
+*.bak
+.env
+.venv
