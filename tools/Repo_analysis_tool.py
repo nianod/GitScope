@@ -1,664 +1,6 @@
-import os
-import sys
-import json
-import csv
-import argparse
-import hashlib
-import re
-import subprocess
-import time
-import logging
-import multiprocessing
-import threading
-import datetime
-import random
-from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from typing import Dict, List, Tuple, Optional, Any
 
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
 
-try:
-    from github import Github, RateLimitExceededException, GithubException
-    HAS_PYGITHUB = True
-except ImportError:
-    HAS_PYGITHUB = False
-
-    class GithubException(Exception):
-        pass
-
-    class RateLimitExceededException(GithubException):
-        pass
-
-    class Github:
-        pass
-
-CSV_LOCK = threading.Lock()
-
-try:
-    import tiktoken
-    HAS_TIKTOKEN = True
-    ENCODING = tiktoken.get_encoding("cl100k_base")
-except ImportError:
-    HAS_TIKTOKEN = False
-    ENCODING = None
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S"
-)
-logger = logging.getLogger(__name__)
-
-MAX_FILE_BYTES = 5 * 1024 * 1024
-SIMILARITY_THRESHOLD = 0.85
-MIN_LOC = 3
-MIN_TOKENS = 20
-MAX_SIMILARITY_PAIRS = 50_000
-MAX_BUCKET_COMPARE = 300
-
-GIT_LOG_TIMEOUT = 120
-CODE_AGE_THRESHOLDS_YEARS = [1, 2]
-REQUIRED_SCC_VERSION = "3.7.0"
-
-# Stage 4: Composite rating criteria
-RATING_CRITERIA = {
-    "commits":           {"min": 75,   "preferred": 200,    "weight": 0.20},
-    "dev_span_months":   {"min": 6,    "preferred": 24,     "weight": 0.15},
-    "contributors":      {"min": 2,    "preferred": 5,      "weight": 0.15},
-    "loc":               {"min": 5_000, "preferred": 50_000, "weight": 0.20},
-    "has_tests":         {"weight": 0.10},
-    "has_ci":            {"weight": 0.10},
-    "test_file_count":   {"min": 20,   "preferred": 200,    "weight": 0.05},
-    "source_file_ratio": {"min": 0.40, "preferred": 0.60,   "weight": 0.05},
-}
-
-# Stage 4: Framework detection — manifest → framework list
-FRAMEWORK_MANIFEST_PARSERS = {
-    "package.json": [
-        "react", "vue", "angular", "svelte",
-        "next", "nuxt", "gatsby", "remix", "astro",
-        "express", "fastify", "nestjs", "koa", "hapi",
-    ],
-    "requirements.txt": [
-        "django", "flask", "fastapi", "tornado",
-        "starlette", "aiohttp", "pyramid", "falcon", "bottle"
-    ],
-    "Pipfile": [
-        "django", "flask", "fastapi"
-    ],
-    "pom.xml": [
-        "spring", "springboot", "quarkus", "micronaut"
-    ],
-    "build.gradle": [
-        "spring", "springboot", "quarkus", "micronaut"
-    ],
-    "Cargo.toml": [
-        "actix", "axum", "warp", "rocket"
-    ],
-    "go.mod": [
-        "gin", "echo", "fiber", "chi", "beego"
-    ],
-    "Gemfile": [
-        "rails", "sinatra", "hanami"
-    ],
-    "composer.json": [
-        "laravel", "symfony", "codeigniter", "yii"
-    ],
-    "mix.exs": [
-        "phoenix"
-    ],
-    "stack.yaml": [
-        "yesod", "scotty"
-    ],
-}
-
-IMPORT_FRAMEWORK_MAP = {
-    "py": {
-        "django": "Django",
-        "flask": "Flask",
-        "fastapi": "FastAPI",
-        "tornado": "Tornado",
-        "starlette": "Starlette",
-        "aiohttp": "aiohttp",
-        "pyramid": "Pyramid",
-        "falcon": "Falcon",
-        "bottle": "Bottle"
-    },
-    "js": {
-        "express": "Express",
-        "next": "Next.js",
-        "react": "React",
-        "vue": "Vue",
-        "angular": "Angular",
-        "fastify": "Fastify",
-        "nestjs": "NestJS",
-        "koa": "Koa",
-        "hapi": "Hapi"
-    },
-    "jsx": {"react": "React"},
-    "tsx": {
-        "react": "React",
-        "next": "Next.js"
-    }
-}
-
-FRONTEND_FRAMEWORKS = {
-    "react", "vue", "angular", "svelte",
-    "next", "nuxt", "gatsby", "remix", "astro"
-}
-
-BACKEND_FRAMEWORKS = {
-    "express", "fastify", "nestjs", "koa", "hapi",
-    "django", "flask", "fastapi", "tornado", "starlette", "aiohttp",
-    "pyramid", "falcon", "bottle",
-    "spring", "springboot", "quarkus", "micronaut",
-    "actix", "axum", "warp", "rocket",
-    "gin", "echo", "fiber", "chi", "beego",
-    "rails", "sinatra", "hanami",
-    "laravel", "symfony", "codeigniter", "yii",
-    "phoenix", "yesod", "scotty"
-}
-
-EXT_TO_LANG_MAP = {
-    '.py': 'Python', '.js': 'JavaScript', '.jsx': 'JSX',
-    '.ts': 'TypeScript', '.tsx': 'TSX', '.go': 'Go',
-    '.java': 'Java', '.c': 'C', '.cpp': 'C++', '.cc': 'C++',
-    '.h': 'C/C++ Header', '.hpp': 'C/C++ Header',
-    '.cs': 'C#', '.rb': 'Ruby', '.php': 'PHP', '.rs': 'Rust',
-    '.html': 'HTML', '.css': 'CSS', '.scss': 'SCSS', '.sass': 'Sass',
-    '.less': 'LESS', '.sql': 'SQL', '.sh': 'Bourne Shell',
-    '.ps1': 'PowerShell', '.bat': 'DOS Batch', '.json': 'JSON',
-    '.xml': 'XML', '.md': 'Markdown', '.yaml': 'YAML', '.yml': 'YAML',
-    '.swift': 'Swift', '.kt': 'Kotlin', '.scala': 'Scala', '.lua': 'Lua'
-}
-
-FORMAL_FRAMEWORK_NAMES = {
-    "react": "React", "next": "Next.js", "vue": "Vue", "angular": "Angular",
-    "svelte": "Svelte", "express": "Express", "fastapi": "FastAPI", "django": "Django",
-    "flask": "Flask", "spring": "Spring Boot", "springboot": "Spring Boot",
-    "postgresql": "PostgreSQL", "postgres": "PostgreSQL", "mongodb": "MongoDB",
-    "redis": "Redis", "mysql": "MySQL", "sqlite": "SQLite", "firebase": "Firebase",
-    "jest": "Jest", "vitest": "Vitest", "cypress": "Cypress", "playwright": "Playwright"
-}
-
-LANG_MERGE_MAP = {
-    "C/C++ Header": "C++",
-    "Jupyter Notebook": "Python",
-    "JSX": "JavaScript",
-    "TSX": "TypeScript"
-}
-
-FRONTEND_LANGUAGES = {
-    "HTML", "CSS", "SCSS", "Sass", "Less",
-    "JavaScript", "TypeScript",
-    "JSX", "TSX",
-    "Vue", "Svelte"
-}
-
-BACKEND_LANGUAGES = {
-    "Python", "Java", "Go", "Rust", "Ruby", "PHP",
-    "C++", "C", "C#", "Scala", "Kotlin",
-    "Elixir", "Haskell", "Perl", "Clojure",
-    "SQL", "Swift", "Dart"
-}
-
-NON_CORE_FORMATS = {
-    "JSON", "XML", "YAML", "CSV", "TOML", "INI", "Protocol Buffers", "Graphviz (DOT)",
-    "SVG", "SQL", "Properties", "Excel", "Parquet", "HCL", "Starlark",
-    "Markdown", "Text", "Plain Text", "reStructuredText", "AsciiDoc", "Doxygen", "Org", "TeX", "Org Mode",
-    "Gradle", "ProGuard", "Windows Resource File", "Maven POM", "Protocol Buffers",
-    "PowerShell", "Bourne Shell", "Bourne Again Shell", "Fish Shell", "DOS Batch", "make",
-    "CMake", "Dockerfile", "Vagrantfile", "Procfile", "Rakefile", "Gemfile", "Pipfile",
-    "BitBake", "Meson", "Kconfig", "QMake", "Bazel",
-    "LESS", "SCSS", "Sass", "Stylus", "PostCSS"
-}
-
-BOILERPLATE_FILES = {
-    "reportwebvitals.js", "setuptests.js", "app.test.js", "logo.svg",
-    "favicon.ico", "service-worker.js", "manifest.json", "robots.txt",
-    "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-    "manage.py", "asgi.py", "wsgi.py", "__init__.py",
-    "mvnw", "mvnw.cmd", "gradlew", "gradlew.bat",
-    "settings.gradle", "gradle-wrapper.properties",
-    "artisan", "server.php",
-    "bundle", "rails", "rake", "setup"
-}
-
-VENDORED_NAMES = {
-    "jquery", "bootstrap", "angular", "react.production", "react-dom.production",
-    "vue.global", "vue.runtime", "lodash", "underscore", "backbone",
-    "d3", "three", "moment", "chart", "highcharts", "leaflet",
-    "popper", "tether", "select2", "datatables", "tinymce", "ckeditor",
-    "ace-editor", "codemirror", "quill", "summernote", "sweetalert",
-    "toastr", "animate", "font-awesome", "normalize", "reset",
-    "polyfill", "modernizr", "respond", "html5shiv", "pace",
-    "hammer", "howler", "socket.io", "fabric", "konva",
-    "excalidraw", "wiris", "mathjax", "katex", "zoom-meeting",
-    "dropbox-sdk", "aws-sdk", "firebase-app", "firebase-auth",
-    "multislider",
-}
-
-VENDORED_DIRS = {
-    "/vendor/", "/vendors/", "/third_party/", "/third-party/",
-    "/bower_components/", "/jspm_packages/", "/web_modules/",
-    "/custom_node_modules/", "/extern/", "/external/", "/lib/vendor/",
-    "/.bundle/", "/cache/", "/deps/",
-    "/site-packages/", "/dist-packages/", "/_vendor/",
-}
-
-BUNDLE_PATTERNS = {"bundle.js", "chunk.js", "vendor.js", "vendors.js", "runtime.js", "main.chunk.js", "vendors~main"}
-
-# Stage 4: Infrastructure & Service Detection
-INFRASTRUCTURE_INDICATORS = {
-    "databases": [
-        "postgres", "postgresql", "mysql", "mongodb", "redis", "sqlite", "elasticsearch",
-        "dynamodb", "mariadb", "oracle", "mssql", "cassandra",
-        "neo4j", "couchdb", "prisma", "sequelize", "mongoose", "psycopg2", "psycopg",
-        "sqlalchemy", "typeorm", "knex", "tortoise-orm", "dj-database-url",
-        "supabase", "pocketbase", "surrealdb", "cockroachdb", "fauna", "influxdb",
-        "snowflake", "clickhouse", "databricks", "firebird", "trino", "presto"
-    ],
-    "deployment": [
-        "docker", "kubernetes", "aws", "azure", "gcp", "heroku", "vercel",
-        "netlify", "terraform", "ansible", "jenkins", "travis", "circleci",
-        "github actions", "dockerfile", "docker-compose"
-    ],
-    "apis": [
-        "stripe", "twilio", "sendgrid", "openai", "firebase", "auth0",
-        "slack", "aws-sdk", "google-cloud", "mailgun", "algolia", "pusher"
-    ]
-}
-
-INFRA_MANIFESTS_TO_CHECK = ["package.json", "requirements.txt", "Pipfile", "pom.xml","build.gradle", "Cargo.toml", "go.mod", "Gemfile", "composer.json", "docker-compose.yml"
-]
-INFRA_CONFIG_FILES_TO_CHECK = [".env", "settings.py", "config.js","web.config", "appsettings.json", "config.php", "configuration.yaml"]
-
-INFRA_DB_EXTENSIONS = {".db", ".sqlite", ".sqlite3", ".mdb", ".accdb", ".rdb"}
-
-INFRA_CODE_EXTENSIONS = {".py", ".js", ".ts", ".php", ".go", ".java", ".rb", ".cs", ".sql"}
-
-INFRA_CONN_MAP = {
-    "postgres://": "postgres",
-    "postgresql://": "postgres",
-    "mysql://": "mysql",
-    "mongodb://": "mongodb",
-    "redis://": "redis"
-}
-
-INFRA_FILE_MAP = {
-    "dockerfile": ("deployment", "docker"),
-    "docker-compose": ("deployment", "docker-compose"),
-    "jenkinsfile": ("deployment", "jenkins"),
-    ".travis.yml": ("deployment", "travis"),
-    "circle.yml": ("deployment", "circleci"),
-    "terraform": ("deployment", "terraform"),
-    ".github/workflows": ("deployment", "github actions")
-}
-
-INFRA_CANONICAL_MAP = {
-    "postgres": "PostgreSQL", "postgresql": "PostgreSQL", "psycopg2": "PostgreSQL", "psycopg": "PostgreSQL",
-    "mongodb": "MongoDB", "mongoose": "MongoDB",
-    "mysql": "MySQL", "mariadb": "MariaDB",
-    "sqlite": "SQLite", "redis": "Redis", "elasticsearch": "Elasticsearch",
-    "dynamodb": "DynamoDB", "cassandra": "Cassandra", "oracle": "Oracle",
-    "mssql": "SQL Server", "neo4j": "Neo4j", "couchdb": "CouchDB",
-    "firebase": "Firebase", "firestore": "Firebase",
-    "prisma": "Prisma (ORM)", "sequelize": "Sequelize (ORM)", "sqlalchemy": "SQLAlchemy (ORM)",
-    "typeorm": "TypeORM", "knex": "Knex.js", "docker": "Docker", "kubernetes": "Kubernetes",
-    "github actions": "GitHub Actions", "docker-compose": "Docker Compose"
-}
-
-DOC_SETUP_KEYWORDS = ['setup', 'install', 'getting started', 'running', 'requirements']
-
-COVERAGE_FILES = ['lcov.info', 'coverage.xml', 'cobertura.xml', '.coverage', 'coverage/index.html']
-
-# Stage 4: Testing & Quality Patterns
-TEST_CASE_PATTERNS = {
-    "python": re.compile(r"def\s+test_"),
-    "javascript": re.compile(r"(it|test)\s*\("),
-    "typescript": re.compile(r"(it|test)\s*\("),
-    "java": re.compile(r"@Test"),
-    "go": re.compile(r"func\s+Test"),
-    "php": re.compile(r"public\s+function\s+test"),
-    "ruby": re.compile(r"test\s+['\"]"),
-}
-
-# Stage 5: Secret / credential scanning patterns
-SECRET_PATTERNS: List[Tuple[str, re.Pattern]] = [
-    ("AWS Access Key",       re.compile(r"AKIA[0-9A-Z]{16}")),
-    ("AWS Secret Key",       re.compile(r"(?i)aws.{0,20}secret.{0,20}['\"][0-9a-zA-Z/+]{40}['\"]")),
-    ("GitHub Token",         re.compile(r"ghp_[0-9a-zA-Z]{36}")),
-    ("GitHub OAuth",         re.compile(r"gho_[0-9a-zA-Z]{36}")),
-    ("GitHub App Token",     re.compile(r"ghu_[0-9a-zA-Z]{36}")),
-    ("Slack Token",          re.compile(r"xox[baprs]-[0-9a-zA-Z\-]{10,48}")),
-    ("Google API Key",       re.compile(r"AIza[0-9A-Za-z\-_]{35}")),
-    ("Stripe Secret Key",    re.compile(r"sk_live_[0-9a-zA-Z]{24,}")),
-    ("Stripe Public Key",    re.compile(r"pk_live_[0-9a-zA-Z]{24,}")),
-    ("Private Key Block",    re.compile(r"-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----")),
-    ("Generic Password",     re.compile(r"(?i)(password|passwd|pwd)\s*[=:]\s*['\"][^'\"]{6,}['\"]")),
-    ("Generic API Key",      re.compile(r"(?i)(api_key|apikey|api-key)\s*[=:]\s*['\"][^'\"]{8,}['\"]")),
-    ("Generic Secret",       re.compile(r"(?i)(secret|token)\s*[=:]\s*['\"][^'\"]{8,}['\"]")),
-    ("DB Connection String", re.compile(r"(?i)(mongodb|postgres|mysql|redis)://[^\s'\"]{10,}")),
-    ("Bearer Token",         re.compile(r"(?i)bearer\s+[0-9a-zA-Z\-._~+/]{20,}")),
-]
-
-SECRET_SCAN_EXTENSIONS = {
-    ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rb", ".php",
-    ".java", ".kt", ".cs", ".env", ".sh", ".bash", ".yml", ".yaml",
-    ".toml", ".ini", ".cfg", ".conf", ".json",
-}
-
-SECRET_SCAN_SKIP = {".lock", ".sum", ".mod"}
-
-# Language name mapping (extension → display name)
-EXT_TO_LANGUAGE: Dict[str, str] = {
-    ".c": "C", ".h": "C",
-    ".cpp": "C++", ".hpp": "C++", ".cc": "C++", ".cxx": "C++",
-    ".c++": "C++", ".hxx": "C++", ".h++": "C++", ".C": "C++", ".H": "C++",
-    ".py": "Python", ".pyw": "Python", ".pyx": "Python",
-    ".pxd": "Python", ".pyi": "Python",
-    ".js": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript",
-    ".jsx": "JavaScript",
-    ".ts": "TypeScript", ".tsx": "TypeScript",
-    ".java": "Java",
-    ".kt": "Kotlin", ".kts": "Kotlin",
-    ".scala": "Scala",
-    ".groovy": "Groovy", ".gradle": "Groovy",
-    ".clj": "Clojure", ".cljs": "Clojure", ".cljc": "Clojure", ".edn": "Clojure",
-    ".cs": "C#",
-    ".fs": "F#", ".fsx": "F#", ".fsi": "F#",
-    ".go": "Go",
-    ".rs": "Rust",
-    ".swift": "Swift",
-    ".m": "Objective-C", ".mm": "Objective-C",
-    ".zig": "Zig",
-    ".nim": "Nim",
-    ".v": "V",
-    ".d": "D",
-    ".ada": "Ada", ".adb": "Ada", ".ads": "Ada",
-    ".sh": "Shell", ".bash": "Shell", ".zsh": "Shell",
-    ".fish": "Shell", ".ksh": "Shell", ".csh": "Shell", ".tcsh": "Shell",
-    ".bat": "Batch", ".cmd": "Batch",
-    ".ps1": "PowerShell",
-    ".rb": "Ruby", ".erb": "Ruby", ".rake": "Ruby",
-    ".php": "PHP", ".php3": "PHP", ".php4": "PHP", ".php5": "PHP", ".phtml": "PHP",
-    ".pl": "Perl", ".pm": "Perl", ".t": "Perl", ".pod": "Perl",
-    ".lua": "Lua",
-    ".r": "R", ".R": "R",
-    ".hs": "Haskell", ".lhs": "Haskell",
-    ".ml": "OCaml", ".mli": "OCaml",
-    ".erl": "Erlang", ".hrl": "Erlang",
-    ".ex": "Elixir", ".exs": "Elixir",
-    ".elm": "Elm",
-    ".lisp": "Lisp", ".lsp": "Lisp", ".cl": "Lisp", ".el": "Lisp",
-    ".scm": "Scheme", ".ss": "Scheme", ".rkt": "Scheme",
-    ".re": "ReasonML", ".rei": "ReasonML",
-    ".purs": "PureScript",
-    ".dart": "Dart",
-    ".jl": "Julia",
-    ".f": "Fortran", ".for": "Fortran", ".f90": "Fortran",
-    ".f95": "Fortran", ".f03": "Fortran", ".f08": "Fortran",
-    ".sol": "Solidity",
-    ".move": "Move",
-    ".vh": "Verilog", ".sv": "Verilog",
-    ".vhd": "VHDL", ".vhdl": "VHDL",
-    ".asm": "Assembly", ".s": "Assembly", ".S": "Assembly",
-    ".vue": "Vue",
-    ".svelte": "Svelte",
-    ".jsp": "JSP", ".asp": "ASP", ".aspx": "ASP.NET",
-    ".sql": "SQL", ".psql": "SQL", ".mysql": "SQL", ".pgsql": "SQL",
-    ".graphql": "GraphQL", ".gql": "GraphQL",
-    ".proto": "Protobuf",
-    ".tf": "Terraform", ".tfvars": "Terraform", ".hcl": "HCL",
-    ".sls": "SaltStack",
-    ".ipynb": "Jupyter",
-    ".pas": "Pascal", ".pp": "Pascal", ".inc": "Pascal",
-    ".cob": "COBOL", ".cbl": "COBOL", ".cpy": "COBOL",
-    ".cr": "Crystal",
-    ".vim": "Vimscript",
-    ".tcl": "Tcl",
-    ".awk": "AWK",
-    ".sed": "Sed",
-    ".mk": "Makefile",
-    ".cmake": "CMake",
-    ".hack": "Hack", ".hh": "Hack",
-    ".groovy": "Groovy",
-}
-
-OPENSOURCE_LICENSE_FILES = {
-    "license", "license.txt", "license.md", "license.rst",
-    "licence", "licence.txt", "licence.md",
-    "copying", "copying.txt", "copying.md",
-}
-
-OPENSOURCE_SPDX_INDICATORS = [
-    "mit license", "apache license", "gnu general public",
-    "bsd license", "bsd 3-clause", "bsd 2-clause", "mozilla public",
-    "isc license", "creative commons", "the unlicense", "eclipse public",
-    "european union public", "common development",
-]
-
-SKIP_DIRS = {
-    '.git', 'node_modules', 'vendor', 'vendors', '__pycache__', 'env', 'venv', '.venv',
-    '.tox', 'build', 'dist', '.idea', '.vscode',
-    '.next', '.nuxt', '.svelte-kit', '.output', '.cache', '.parcel-cache',
-    'out', 'coverage', '.pytest_cache', '.mypy_cache',
-    '.env', 'virtualenv', 'conda-env', 'site-packages', 'dist-packages',
-    '.yarn', '.pnp', 'bower_components', 'jspm_packages', 'web_modules',
-    'migrations', 'alembic',
-    'test', 'tests', 'spec', 'specs',
-    'examples', 'samples', 'demo', 'benchmarks', 'screenshots',
-    'Lib', 'lib64', 'Scripts', 'bin', 'Include', 'obj',
-    'third_party', 'third-party', 'extern', 'external', 'custom_node_modules'
-}
-
-SKIP_EXTENSIONS = {
-    '.pyc', '.pyo', '.exe', '.dll', '.so', '.dylib', '.gitignore', '.gitmodules',
-    '.zip', '.tar', '.gz', '.jpg', '.jpeg', '.png', '.gif',
-    '.pdf', '.mp4', '.mp3', '.ttf', '.woff', '.woff2',
-    '.eot', '.otf', '.ico', '.svg', '.webp', '.bmp',
-    '.json', '.md', '.markdown', '.txt', '.yaml', '.yml', '.toml', '.xml', '.csv', '.tsv',
-    '.diff', '.patch',
-    '.org', '.rc', '.pro', '.properties', '.gradle', '.pom'
-}
-
-C_EXTENSIONS = {".c", ".h"}
-CPP_EXTENSIONS = {".cpp", ".hpp", ".cc", ".cxx", ".c++", ".hxx", ".h++", ".C", ".H"}
-PYTHON_EXTENSIONS = {".py", ".pyw", ".pyx", ".pxd", ".pyi"}
-JAVASCRIPT_EXTENSIONS = {".js", ".mjs", ".cjs"}
-TYPESCRIPT_EXTENSIONS = {".ts", ".tsx"}
-JSX_EXTENSIONS = {".jsx"}
-FRONTEND_FRAMEWORK_EXTENSIONS = {".vue", ".svelte"}
-JAVA_EXTENSIONS = {".java"}
-KOTLIN_EXTENSIONS = {".kt", ".kts"}
-SCALA_EXTENSIONS = {".scala"}
-GROOVY_EXTENSIONS = {".groovy", ".gradle"}
-CLOJURE_EXTENSIONS = {".clj", ".cljs", ".cljc", ".edn"}
-CSHARP_EXTENSIONS = {".cs"}
-FSHARP_EXTENSIONS = {".fs", ".fsx", ".fsi"}
-GO_EXTENSIONS = {".go"}
-RUST_EXTENSIONS = {".rs"}
-SWIFT_EXTENSIONS = {".swift"}
-OBJC_EXTENSIONS = {".m", ".mm"}
-UNIX_SHELL_EXTENSIONS = {".sh", ".bash", ".zsh", ".fish", ".ksh", ".csh", ".tcsh"}
-WINDOWS_SHELL_EXTENSIONS = {".bat", ".cmd", ".ps1"}
-RUBY_EXTENSIONS = {".rb", ".erb", ".rake"}
-PHP_EXTENSIONS = {".php", ".php3", ".php4", ".php5", ".phtml"}
-PERL_EXTENSIONS = {".pl", ".pm", ".t", ".pod"}
-LUA_EXTENSIONS = {".lua"}
-R_EXTENSIONS = {".r", ".R"}
-HASKELL_EXTENSIONS = {".hs", ".lhs"}
-OCAML_EXTENSIONS = {".ml", ".mli"}
-ERLANG_EXTENSIONS = {".erl", ".hrl"}
-ELIXIR_EXTENSIONS = {".ex", ".exs"}
-ELM_EXTENSIONS = {".elm"}
-DART_EXTENSIONS = {".dart"}
-JULIA_EXTENSIONS = {".jl"}
-NIM_EXTENSIONS = {".nim"}
-CRYSTAL_EXTENSIONS = {".cr"}
-ZIG_EXTENSIONS = {".zig"}
-V_EXTENSIONS = {".v"}
-VERILOG_EXTENSIONS = {".vh", ".sv"}
-VHDL_EXTENSIONS = {".vhd", ".vhdl"}
-ASSEMBLY_EXTENSIONS = {".asm", ".s", ".S"}
-SOLIDITY_EXTENSIONS = {".sol"}
-MOVE_EXTENSIONS = {".move"}
-WEB_TEMPLATE_EXTENSIONS = {".jsp", ".asp", ".aspx"}
-SQL_EXTENSIONS = {".sql", ".psql", ".mysql", ".pgsql"}
-GRAPHQL_EXTENSIONS = {".graphql", ".gql"}
-PROTOBUF_EXTENSIONS = {".proto"}
-TERRAFORM_EXTENSIONS = {".tf", ".tfvars", ".hcl"}
-SALT_EXTENSIONS = {".sls"}
-JUPYTER_EXTENSIONS = {".ipynb"}
-PASCAL_EXTENSIONS = {".pas", ".pp", ".inc"}
-FORTRAN_EXTENSIONS = {".f", ".for", ".f90", ".f95", ".f03", ".f08"}
-COBOL_EXTENSIONS = {".cob", ".cbl", ".cpy"}
-ADA_EXTENSIONS = {".ada", ".adb", ".ads"}
-D_EXTENSIONS = {".d"}
-LISP_EXTENSIONS = {".lisp", ".lsp", ".cl", ".el"}
-SCHEME_EXTENSIONS = {".scm", ".ss", ".rkt"}
-VIM_EXTENSIONS = {".vim"}
-TCL_EXTENSIONS = {".tcl"}
-AWK_EXTENSIONS = {".awk"}
-SED_EXTENSIONS = {".sed"}
-MAKEFILE_EXTENSIONS = {".mk"}
-CMAKE_EXTENSIONS = {".cmake"}
-HACK_EXTENSIONS = {".hack", ".hh"}
-REASON_EXTENSIONS = {".re", ".rei"}
-PURESCRIPT_EXTENSIONS = {".purs"}
-
-CODE_EXTENSIONS = (
-    C_EXTENSIONS | CPP_EXTENSIONS | PYTHON_EXTENSIONS | JAVASCRIPT_EXTENSIONS |
-    TYPESCRIPT_EXTENSIONS | JSX_EXTENSIONS | FRONTEND_FRAMEWORK_EXTENSIONS |
-    JAVA_EXTENSIONS | KOTLIN_EXTENSIONS | SCALA_EXTENSIONS | GROOVY_EXTENSIONS |
-    CLOJURE_EXTENSIONS | CSHARP_EXTENSIONS | FSHARP_EXTENSIONS | GO_EXTENSIONS |
-    RUST_EXTENSIONS | SWIFT_EXTENSIONS | OBJC_EXTENSIONS | UNIX_SHELL_EXTENSIONS |
-    WINDOWS_SHELL_EXTENSIONS | RUBY_EXTENSIONS | PHP_EXTENSIONS | PERL_EXTENSIONS |
-    LUA_EXTENSIONS | R_EXTENSIONS | HASKELL_EXTENSIONS | OCAML_EXTENSIONS |
-    ERLANG_EXTENSIONS | ELIXIR_EXTENSIONS | ELM_EXTENSIONS | DART_EXTENSIONS |
-    JULIA_EXTENSIONS | NIM_EXTENSIONS | CRYSTAL_EXTENSIONS | ZIG_EXTENSIONS |
-    V_EXTENSIONS | VERILOG_EXTENSIONS | VHDL_EXTENSIONS | ASSEMBLY_EXTENSIONS |
-    SOLIDITY_EXTENSIONS | MOVE_EXTENSIONS | WEB_TEMPLATE_EXTENSIONS |
-    SQL_EXTENSIONS | GRAPHQL_EXTENSIONS | PROTOBUF_EXTENSIONS |
-    TERRAFORM_EXTENSIONS | SALT_EXTENSIONS |
-    JUPYTER_EXTENSIONS | PASCAL_EXTENSIONS | FORTRAN_EXTENSIONS |
-    COBOL_EXTENSIONS | ADA_EXTENSIONS | D_EXTENSIONS | LISP_EXTENSIONS |
-    SCHEME_EXTENSIONS | VIM_EXTENSIONS | TCL_EXTENSIONS | AWK_EXTENSIONS |
-    SED_EXTENSIONS | MAKEFILE_EXTENSIONS | CMAKE_EXTENSIONS | HACK_EXTENSIONS |
-    REASON_EXTENSIONS | PURESCRIPT_EXTENSIONS
-)
-
-NON_CODE_EXTENSIONS = {
-    ".md", ".markdown", ".rst", ".txt", ".adoc", ".tex",
-    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
-    ".xml", ".csv", ".tsv", ".dat",
-    ".log", ".tmp", ".temp", ".bak", ".swp", ".swo",
-    ".lock", ".pem", ".crt", ".key", ".cer",
-    ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar"
-}
-
-# Text assets that are useful to an LLM even though they are not source code.
-DOC_TEXT_EXTENSIONS = {".md", ".markdown", ".rst", ".txt", ".adoc", ".tex"}
-CONFIG_TEXT_EXTENSIONS = {".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml"}
-LLM_TEXT_EXTENSIONS = DOC_TEXT_EXTENSIONS | CONFIG_TEXT_EXTENSIONS
-
-# Business-defined non-authored directories. The authored SCC scan excludes
-# these in addition to SCC-detected generated files (--no-gen).
-SCC_NON_AUTHORED_DIRS = {
-    ".git", ".hg", ".svn", "vendor", "node_modules", "dist", "build",
-    "generated", "migrations", "autogen", "auto-generated", "generated-src",
-    "generated-code", "__pycache__", ".pytest_cache", "obj", "coverage",
-    ".nyc_output", ".next", ".nuxt", ".gradle", ".cxx", "Pods",
-    "DerivedData", "vendor_prefixed", "vendor8", "bower_components",
-    "generated-sources", "intermediates", ".idea", ".kotlin", ".vite",
-    ".cache",
-}
-
-# SCC recognizes documentation/configuration/data formats too. They remain in
-# total repository LOC, but are not source-code token inputs; their tokens are
-# counted independently through DOC_TEXT_EXTENSIONS/CONFIG_TEXT_EXTENSIONS.
-SCC_NON_SOURCE_LANGUAGES = {
-    "JSON", "XML", "YAML", "CSV", "TOML", "INI", "Plain Text", "Text",
-    "Markdown", "reStructuredText", "AsciiDoc", "Doxygen", "Org", "Org Mode",
-    "TeX", "SVG", "Properties", "Excel", "Parquet", "License",
-}
-
-SPECIAL_CODE_FILES = {
-    "dockerfile": "code", "makefile": "code", "gnumakefile": "code",
-    "rakefile": "code", "gemfile": "code", "vagrantfile": "code",
-    "jenkinsfile": "code", "podfile": "code", "brewfile": "code",
-    "cakefile": "code", "guardfile": "code", "fastfile": "code",
-    "dangerfile": "code"
-}
-
-EXCLUDED_SPECIAL_FILES = {
-    "readme", "license", "licence", "changelog", "changes",
-    "authors", "contributors", "notice", "patents", "copying",
-    "todo", "history", "news", "thanks", "credits", "citation"
-}
-
-CONFIG_FILENAMES = {
-    'requirements.txt', 'package.json', 'pom.xml',
-    'build.gradle', 'cargo.toml', 'dockerfile', 'makefile', 'setup.py',
-    'gemfile', 'rakefile', 'podfile'
-}
-
-CI_FILENAMES = {
-    ".gitlab-ci.yml", ".gitlab-ci.yaml", "circle.yml", ".circleci",
-    "azure-pipelines.yml", "azure-pipelines.yaml", ".travis.yml",
-    "appveyor.yml", "jenkinsfile"
-}
-
-CI_DIRECTORIES = {".github/workflows", ".circleci", ".azure-pipelines"}
-
-CI_PATH_PATTERNS = {'.github/workflows', '.github\\workflows', '.circleci/', '.gitlab-ci', 'azure-pipelines'}
-
-_overlap = CODE_EXTENSIONS & NON_CODE_EXTENSIONS
-if _overlap:
-    raise ValueError(
-        f"CRITICAL: Extension overlap detected between CODE and NON_CODE: {_overlap}\n"
-        f"This indicates a configuration error. Please review extension definitions."
-    )
-
-allCodeExts = []
-
-extSets = [
-    C_EXTENSIONS, CPP_EXTENSIONS, PYTHON_EXTENSIONS, JAVASCRIPT_EXTENSIONS,
-    TYPESCRIPT_EXTENSIONS, JSX_EXTENSIONS, FRONTEND_FRAMEWORK_EXTENSIONS,
-    JAVA_EXTENSIONS, KOTLIN_EXTENSIONS, SCALA_EXTENSIONS, GROOVY_EXTENSIONS,
-    CLOJURE_EXTENSIONS, CSHARP_EXTENSIONS, FSHARP_EXTENSIONS, GO_EXTENSIONS,
-    RUST_EXTENSIONS, SWIFT_EXTENSIONS, OBJC_EXTENSIONS, UNIX_SHELL_EXTENSIONS,
-    WINDOWS_SHELL_EXTENSIONS, RUBY_EXTENSIONS, PHP_EXTENSIONS, PERL_EXTENSIONS,
-    LUA_EXTENSIONS, R_EXTENSIONS, HASKELL_EXTENSIONS, OCAML_EXTENSIONS,
-    ERLANG_EXTENSIONS, ELIXIR_EXTENSIONS, ELM_EXTENSIONS, DART_EXTENSIONS,
-    JULIA_EXTENSIONS, NIM_EXTENSIONS, CRYSTAL_EXTENSIONS, ZIG_EXTENSIONS,
-    V_EXTENSIONS, VERILOG_EXTENSIONS, VHDL_EXTENSIONS, ASSEMBLY_EXTENSIONS,
-    SOLIDITY_EXTENSIONS, MOVE_EXTENSIONS, WEB_TEMPLATE_EXTENSIONS,
-    SQL_EXTENSIONS, GRAPHQL_EXTENSIONS, PROTOBUF_EXTENSIONS,
-    TERRAFORM_EXTENSIONS, SALT_EXTENSIONS,
-    JUPYTER_EXTENSIONS, PASCAL_EXTENSIONS, FORTRAN_EXTENSIONS,
-    COBOL_EXTENSIONS, ADA_EXTENSIONS, D_EXTENSIONS, LISP_EXTENSIONS,
-    SCHEME_EXTENSIONS, VIM_EXTENSIONS, TCL_EXTENSIONS, AWK_EXTENSIONS,
-    SED_EXTENSIONS, MAKEFILE_EXTENSIONS, CMAKE_EXTENSIONS, HACK_EXTENSIONS,
-    REASON_EXTENSIONS, PURESCRIPT_EXTENSIONS
-]
-
-for extGroup in extSets:
-    allCodeExts.extend(extGroup)
-
-if len(allCodeExts) != len(set(allCodeExts)):
-    from collections import Counter
-    duplicates = [ext for ext, count in Counter(allCodeExts).items() if count > 1]
-    raise ValueError(
-        f"CRITICAL: Duplicate extensions found in CODE_EXTENSIONS groups: {duplicates}\n"
-        f"Each extension should appear in only one group."
-    )
-
+from config.constants import *  
 
 def getWorkerCount() -> int:
     try:
@@ -673,7 +15,7 @@ def getAdaptiveBatchSize(fileList: List[str]) -> int:
         if HAS_PSUTIL:
             availableMb = psutil.virtual_memory().available / (1024 * 1024)
         else:
-            availableMb = 4096  # Assume 4GB if psutil missing
+            availableMb = 4096  
         safeFiles = int((availableMb * 0.80 * 1024) / 50)
         return max(50, min(safeFiles, len(fileList)))
     except Exception:
@@ -681,7 +23,7 @@ def getAdaptiveBatchSize(fileList: List[str]) -> int:
 
 
 def logResourceStats(label: str = "") -> None:
-    """Log current CPU and RAM usage statistics."""
+    
     if not HAS_PSUTIL:
         return
     try:
@@ -740,7 +82,7 @@ def cloneRepo(repoUrl: str, targetDir: str, githubToken: Optional[str] = None,
     maskedUrl = repoUrl
     tokens_to_mask = []
 
-    # Check for GitLab
+    
     glInfo = extractGitLabRepoInfo(targetDir, repoUrl)
     if glInfo and gitlabToken:
         domain, project_path, _ = glInfo
@@ -748,7 +90,7 @@ def cloneRepo(repoUrl: str, targetDir: str, githubToken: Optional[str] = None,
         maskedUrl = f"https://oauth2:[MASKED]@{domain}/{project_path}.git"
         tokens_to_mask.append(gitlabToken)
     else:
-        # Check for Bitbucket
+        
         bbInfo = extractBitbucketRepoInfo(targetDir, repoUrl)
         if bbInfo and bitbucketToken:
             domain, workspace, repo, _is_cloud = bbInfo
@@ -756,7 +98,7 @@ def cloneRepo(repoUrl: str, targetDir: str, githubToken: Optional[str] = None,
             maskedUrl = f"https://x-token-auth:[MASKED]@{domain}/{workspace}/{repo}.git"
             tokens_to_mask.append(bitbucketToken)
         else:
-            # Check for GitHub
+            
             ghInfo = extractGitHubRepoInfo(targetDir, repoUrl)
             if ghInfo and githubToken:
                 owner, repo = ghInfo
@@ -856,7 +198,7 @@ def hashFile(filepath: str) -> str:
 
 
 def readFileSafe(filepath: str) -> Optional[str]:
-    """Read a file safely using utf-8 or latin-1 fallback."""
+    
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             return f.read()
@@ -871,7 +213,7 @@ def readFileSafe(filepath: str) -> Optional[str]:
 
 
 def classifyFile(filename: str, ext: str) -> Tuple[bool, str]:
-    """Determine if a file is code or non-code based on extensions."""
+    
     nameLower = filename.lower()
 
     if nameLower in EXCLUDED_SPECIAL_FILES:
@@ -890,10 +232,7 @@ def classifyFile(filename: str, ext: str) -> Tuple[bool, str]:
 
 
 def runStage1Analysis(rootDir: str, maxFiles: Optional[int] = None) -> Tuple[Dict[str, Any], List[str]]:
-    """
-    Perform directory traversal to extract structure and detect repo health signals.
-    Single-threaded I/O walk optimized for speed.
-    """
+    
     structure = {"dirs": 0, "files": 0, "extensions": defaultdict(int)}
     signals = {"hasSource": False, "hasTests": False, "hasConfig": False, "hasCI": False}
     fileList = []
@@ -916,8 +255,8 @@ def runStage1Analysis(rootDir: str, maxFiles: Optional[int] = None) -> Tuple[Dic
             basename = os.path.basename(file)
             basenameLower = basename.lower()
 
-            # Documentation/configuration is part of the LLM context even though
-            # several of these extensions are excluded from code-only analysis.
+            
+            
             if (ext in SKIP_EXTENSIONS and ext not in LLM_TEXT_EXTENSIONS) or (file.startswith('.') and ext):
                 continue
 
@@ -991,7 +330,7 @@ def getSccCommand() -> str:
 
 
 def validateSccVersion() -> None:
-    """Fail fast unless the installed SCC version is the required one."""
+    
     scc_command = getSccCommand()
     try:
         result = subprocess.run(
@@ -1026,14 +365,7 @@ def validateSccVersion() -> None:
 
 
 def runScc(repoDir: str, authoredOnly: bool = False) -> Dict[str, Any]:
-    """
-    Run SCC and return normalized totals, language breakdown, and source files.
-
-    The total scan matches `scc .`. The authored scan applies the agreed
-    business policy: SCC-generated files plus configured dependency/vendor/
-    build/migration directories are non-authored. `source_files` contains only
-    authored programming-language files and drives source token calculation.
-    """
+    
     try:
         cmd = [getSccCommand(), "--format", "json2"]
         if authoredOnly:
@@ -1107,12 +439,7 @@ def runScc(repoDir: str, authoredOnly: bool = False) -> Dict[str, Any]:
 
 
 def processFileBatch(batch: List[Any]) -> List[Dict[str, Any]]:
-    """
-    Worker function to process file batch in parallel.
-    Computes LOC, tokens, and prepares data for duplication analysis.
-    Code, documentation, and configuration files contribute to token metrics.
-    Duplication and AI-detection inputs remain code-only.
-    """
+    
     results = []
     for workItem in batch:
         if isinstance(workItem, (tuple, list)):
@@ -1138,12 +465,12 @@ def processFileBatch(batch: List[Any]) -> List[Dict[str, Any]]:
         )
 
         try:
-            # SCC-authored source files define the complete code-token corpus.
-            # Preserve the historical size cap only for docs/config assets.
+            
+            
             if category != "code" and os.path.getsize(filepath) > MAX_FILE_BYTES:
                 continue
 
-            # One disk read supplies binary detection, hashing, and tokenization.
+            
             with open(filepath, "rb") as f:
                 raw = f.read()
             if b"\x00" in raw[:8192]:
@@ -1160,7 +487,7 @@ def processFileBatch(batch: List[Any]) -> List[Dict[str, Any]]:
 
             tokenList = frozenset(lexicalTokenList) if isCode and (10 < lexicalTokens < 5000) else frozenset()
 
-            # Framework detection via imports (first 100 lines)
+            
             foundFws = []
             if ext.lstrip('.') in IMPORT_FRAMEWORK_MAP:
                 lines = content.splitlines()[:100]
@@ -1189,11 +516,7 @@ def processFileBatch(batch: List[Any]) -> List[Dict[str, Any]]:
 def runStage2Analysis(
     fileList: List[str], authoredCodeFiles: Optional[List[str]] = None
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, List[str]]]:
-    """
-    Execute parallel deep analysis to compute total/per-file metrics,
-    exact duplication (hash-based), and similarity-based duplication (Jaccard clustering).
-    Uses ProcessPoolExecutor for CPU-bound tokenization.
-    """
+    
     authoredSet = {
         os.path.normcase(os.path.abspath(path)) for path in (authoredCodeFiles or [])
     }
@@ -1242,7 +565,7 @@ def runStage2Analysis(
     completedFiles = 0
     t0 = time.time()
 
-    # Avoid process startup/pickling overhead for a single small batch.
+    
     if len(batches) == 1:
         completedBatches = [processFileBatch(batches[0])]
     else:
@@ -1453,11 +776,7 @@ def runAiDetectionAnalysis(
     duplicationMetrics: Dict[str, Any],
     fileTokensMap: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Execute AI-generated code detection using multi-signal heuristics.
-    Weighted combination: duplication (30%), similarity (20%), cluster density (25%),
-    uniformity (15%), naming (10%).
-    """
+    
     totalFiles = len(fileStats)
     if totalFiles == 0:
         return {"repo_score": 0.0, "confidence": "none", "signals": {}}
@@ -1526,7 +845,7 @@ def runAiDetectionAnalysis(
 
 
 def runGit(args: List[str], cwd: str, timeout: int = GIT_LOG_TIMEOUT) -> Optional[str]:
-    """Run a git command safely, returning stdout or None on failure."""
+    
     try:
         result = subprocess.run(
             ["git"] + args,
@@ -1546,7 +865,7 @@ def runGit(args: List[str], cwd: str, timeout: int = GIT_LOG_TIMEOUT) -> Optiona
 
 def prepareAnalysisBranch(repoDir: str, requestedBranch: Optional[str],
                           localRepository: bool = False) -> Tuple[bool, Dict[str, str]]:
-    """Select a branch; local working copies are checked out without fetching/merging."""
+    
     requestedBranch = (requestedBranch or "").strip()
     remoteHead = runGit(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], repoDir)
     if not remoteHead and not localRepository:
@@ -1566,8 +885,8 @@ def prepareAnalysisBranch(repoDir: str, requestedBranch: Optional[str],
             return False, {}
 
     if targetBranch:
-        # Refresh the requested/default remote branch when possible. Failure is
-        # tolerated only when the corresponding local branch already exists.
+        
+        
         if not localRepository:
             runGit(["fetch", "origin", targetBranch], repoDir, timeout=300)
         localExists = runGit(["rev-parse", "--verify", f"refs/heads/{targetBranch}"], repoDir)
@@ -1586,7 +905,7 @@ def prepareAnalysisBranch(repoDir: str, requestedBranch: Optional[str],
             )
             return False, {}
         if remoteExists and not localRepository:
-            # Never rewrite history; update only when a clean fast-forward is possible.
+            
             if runGit(["merge", "--ff-only", f"origin/{targetBranch}"], repoDir, timeout=300) is None:
                 logger.error(
                     f"[branch] Could not fast-forward '{targetBranch}' to origin/{targetBranch}. "
@@ -1603,28 +922,15 @@ def prepareAnalysisBranch(repoDir: str, requestedBranch: Optional[str],
 
 
 def getAllContributors(repoDir: str) -> List[Dict[str, Any]]:
-    """
-    Return a structured list of every contributor discovered from git history.
-
-    Uses ``git shortlog -sne --all`` which emits lines of the form:
-        <commit_count>\\t<Name> <email>
-
-    This is additive metadata only — it does NOT affect unique_contributors,
-    commit_count, or any other existing Stage 0 field.
-
-    Returns a list of dicts:
-        [{"name": str, "email": str, "commits": int}, ...]
-    sorted descending by commit count.
-    On any failure returns an empty list (no crash, no pipeline impact).
-    """
-    # Use a dedicated timeout — shortlog on repos with 10k+ commits can be slow.
-    # 300 s is generous; on failure we return [] safely, never crash.
+    
+    
+    
     raw = runGit(["shortlog", "-sne", "--all"], repoDir, timeout=300)
     if not raw:
         return []
 
     contributors: List[Dict[str, Any]] = []
-    # Regex: optional leading spaces, commit count, tab, display name + optional <email>
+    
     lineRe = re.compile(
         r"^\s*(\d+)\s+(.+?)(?:\s+<([^>]*)>)?\s*$"
     )
@@ -1637,7 +943,7 @@ def getAllContributors(repoDir: str) -> List[Dict[str, Any]]:
             continue
         commitCountStr, rawName, rawEmail = m.group(1), m.group(2), m.group(3)
 
-        # Trim whitespace only — no identity merging
+        
         name = (rawName or "").strip() or ""
         email = (rawEmail or "").strip() or ""
 
@@ -1652,19 +958,14 @@ def getAllContributors(repoDir: str) -> List[Dict[str, Any]]:
     return contributors
 
 def getAllCommitsDetailed(repoDir: str) -> List[Dict[str, Any]]:
-    """
-    Return one row per commit with hash, author, email, date, message,
-    and whether it's 'meaningful'.
-    Merge commits are always marked not-meaningful, matching the
-    --no-merges logic used for meaningful_commit_count in Stage 0.
-    """
+    
     FIELD_SEP = "\x1f"
     RECORD_SEP = "\x1e"
     fmt = f"%H{FIELD_SEP}%an{FIELD_SEP}%ae{FIELD_SEP}%ci{FIELD_SEP}%P{FIELD_SEP}%D{FIELD_SEP}%B{RECORD_SEP}"
 
-    # Traverse every fetched reference.  This includes commits which are not
-    # reachable from the currently checked-out branch while remaining honest
-    # about history which was never fetched or is no longer reachable.
+    
+    
+    
     raw = runGit(["log", "--all", f"--format={fmt}"], repoDir, timeout=300)
     if not raw:
         return []
@@ -1712,13 +1013,7 @@ def getAllCommitsDetailed(repoDir: str) -> List[Dict[str, Any]]:
     return commits
 
 def runStage0GitAnalysis(repoDir: str) -> Dict[str, Any]:
-    """
-    Stage 0 — Git Metadata Extraction.
-
-    Collects without cloning: commit count, unique contributors, active
-    development span, commit quality, and full-history integrity signals.
-    Requires the directory to be a valid git repository.
-    """
+    
     result: Dict[str, Any] = {
         "available": False,
         "commit_count": 0,
@@ -1740,7 +1035,7 @@ def runStage0GitAnalysis(repoDir: str) -> Dict[str, Any]:
         "branch_selection_source": None,
     }
 
-    # Quick sanity-check: is this a git repo?
+    
     if not os.path.isdir(os.path.join(repoDir, ".git")):
         result["notes"] = "Not a git repository — Stage 0 skipped."
         return result
@@ -1873,11 +1168,7 @@ def runStage0GitAnalysis(repoDir: str) -> Dict[str, Any]:
 def computeLanguageBreakdown(
     fileList: List[str], perFileLoc: Dict[str, int]
 ) -> Dict[str, Any]:
-    """
-    Map every analysed file to a display language name using EXT_TO_LANGUAGE.
-    Returns per-language LOC counts, file counts, and percentage shares.
-    Also detects special extensionless code files (Dockerfile, Makefile, etc.).
-    """
+    
     langLoc: Dict[str, int] = defaultdict(int)
     langFiles: Dict[str, int] = defaultdict(int)
     totalLoc = sum(perFileLoc.values())
@@ -1889,7 +1180,7 @@ def computeLanguageBreakdown(
             lang = name.capitalize()
         else:
             lang = EXT_TO_LANGUAGE.get(ext) or EXT_TO_LANGUAGE.get(
-                os.path.splitext(fp)[1]  # try original case for .R etc.
+                os.path.splitext(fp)[1]  
             )
 
         if not lang:
@@ -1916,10 +1207,7 @@ def computeLanguageBreakdown(
 
 
 def detectFrameworks(repoDir: str) -> Dict[str, List[str]]:
-    """
-    Scan manifest files recursively for framework/library keywords.
-    Aggregates results from all found manifests (useful for monorepos).
-    """
+    
     detected: Dict[str, List[str]] = {}
 
     for root, _, files in os.walk(repoDir):
@@ -1945,12 +1233,7 @@ def detectFrameworks(repoDir: str) -> Dict[str, List[str]]:
 
 
 def analyzeCodeAge(repoDir: str, fileList: List[str]) -> Dict[str, Any]:
-    """
-    Determine staleness of the codebase by querying the last-modified commit
-    date for a sample of files via `git log --follow`.
-    Returns the fraction of files not touched in the past 1 and 2 years,
-    plus a breakdown bucket.
-    """
+    
     result: Dict[str, Any] = {
         "available": False,
         "sampled_files": 0,
@@ -1967,7 +1250,7 @@ def analyzeCodeAge(repoDir: str, fileList: List[str]) -> Dict[str, Any]:
         "<6m": 0, "6m-1yr": 0, "1yr-2yr": 0, ">2yr": 0
     }
     sample = fileList[:500]
-    ages: List[float] = []          # age in months
+    ages: List[float] = []          
 
     for fp in sample:
         rel = os.path.relpath(fp, repoDir)
@@ -2012,7 +1295,7 @@ def analyzeCodeAge(repoDir: str, fileList: List[str]) -> Dict[str, Any]:
 
 
 def detectInfrastructure(repoDir: str) -> Dict[str, List[str]]:
-    """Scan manifests and files for DBs, Deployment tools, and API usage recursively."""
+    
     found = {"databases": set(), "deployment": set(), "apis": set()}
 
     for root, _, files in os.walk(repoDir):
@@ -2030,7 +1313,7 @@ def detectInfrastructure(repoDir: str) -> Dict[str, List[str]]:
                                 if k in content:
                                     found[cat].add(k)
 
-                        # Special Firebase Logic
+                        
                         if "firebase" in content:
                             found["apis"].add("firebase")
                             if any(x in content for x in ["firestore", "firebase-database", "realtime-database"]):
@@ -2063,8 +1346,8 @@ def detectInfrastructure(repoDir: str) -> Dict[str, List[str]]:
 
                         for cat, keywords in INFRASTRUCTURE_INDICATORS.items():
                             for k in keywords:
-                                # Stricter regex: must be an import, require, or connection string
-                                # Patterns: import k, from k, require('k'), k://, new k(
+                                
+                                
                                 patterns = [
                                     rf"\bimport\s+{re.escape(k)}\b",
                                     rf"\bfrom\s+{re.escape(k)}\b",
@@ -2077,11 +1360,11 @@ def detectInfrastructure(repoDir: str) -> Dict[str, List[str]]:
                 except Exception:
                     pass
 
-        # 3. Detect via File Extensions (e.g. .sql files)
+        
         if any(f.endswith(".sql") for f in files):
             found["databases"].add("SQL (Schema found)")
 
-    # 2. Check for specific filenames
+    
 
     for root, dirs, files in os.walk(repoDir):
         if any(sd in root for sd in SKIP_DIRS):
@@ -2100,11 +1383,11 @@ def detectInfrastructure(repoDir: str) -> Dict[str, List[str]]:
     for cat, items in found.items():
         mapped = set()
         for item in items:
-            # Map to canonical name if exists, otherwise title-case it
+            
             name = INFRA_CANONICAL_MAP.get(item.lower(), item.title())
             mapped.add(name)
 
-        # Deduplicate redundant ORM vs DB entries if both exist
+        
         final_list = sorted(list(mapped))
         result[cat] = final_list
 
@@ -2112,24 +1395,23 @@ def detectInfrastructure(repoDir: str) -> Dict[str, List[str]]:
 
 
 def isVendoredOrGenerated(filepath: str, filename: str) -> bool:
-    """Detect vendored, minified, or generated files — mimics GitLab Linguist."""
     fnLower = filename.lower()
     fpLower = filepath.replace("\\", "/").lower()
 
     if fnLower in BOILERPLATE_FILES:
         return True
 
-    # 1. Minified files
+    
     if fnLower.endswith((".min.js", ".min.css", ".min.map")):
         return True
 
-    # 2. Source maps
+    
     if fnLower.endswith((".js.map", ".css.map")):
         return True
 
-    # 3. Known vendored library names
+    
     nameNoExt = os.path.splitext(fnLower)[0]
-    # Strip version suffixes like "jquery-3.6.0" -> "jquery"
+    
     nameBase = nameNoExt.split("-")[0].split(".")[0]
     if nameBase in VENDORED_NAMES or nameNoExt in VENDORED_NAMES:
         return True
@@ -2137,18 +1419,18 @@ def isVendoredOrGenerated(filepath: str, filename: str) -> bool:
         if vn in fnLower:
             return True
 
-    # 4. Vendored directories
+    
     for vd in VENDORED_DIRS:
         if vd in fpLower:
             return True
 
-    # 5. Bundle / chunk patterns (webpack, rollup, parcel output)
+    
     if fnLower in BUNDLE_PATTERNS or any(p in fnLower for p in BUNDLE_PATTERNS):
         return True
 
-    # 6. Large single-line files (machine-generated) — check first 4KB
+    
     try:
-        if os.path.getsize(filepath) > 1024 * 1024:  # > 1MB
+        if os.path.getsize(filepath) > 1024 * 1024:  
             with open(filepath, "r", encoding="utf-8", errors="ignore") as fh:
                 sample = fh.read(4096)
                 if sample and "\n" not in sample.strip() and len(sample) >= 4000:
@@ -2160,14 +1442,10 @@ def isVendoredOrGenerated(filepath: str, filename: str) -> bool:
 
 
 def calculateByteBreakdown(repoDir: str) -> Dict[str, int]:
-    """Calculate total bytes per language using GitLab Linguist-style rules.
-
-    Excludes: minified files, vendored libraries, generated bundles,
-    source maps, and machine-generated single-line files.
-    """
+    
     byte_counts = {}
     for root, dirs, files in os.walk(repoDir):
-        # Prune skip directories and virtual environments
+        
         def _is_venv_dir(d, parent):
             candidate = os.path.join(parent, d)
             return (os.path.isdir(os.path.join(candidate, "Lib", "site-packages")) or
@@ -2186,7 +1464,7 @@ def calculateByteBreakdown(repoDir: str) -> Dict[str, int]:
 
             filepath = os.path.join(root, f)
 
-            # Skip vendored / generated / minified
+            
             if isVendoredOrGenerated(filepath, f):
                 continue
 
@@ -2195,7 +1473,7 @@ def calculateByteBreakdown(repoDir: str) -> Dict[str, int]:
 
             try:
                 size = os.path.getsize(filepath)
-                # Quick scan for identity (first 50 lines)
+                
                 if ext in {'.py', '.js', '.jsx', '.ts', '.tsx'}:
                     with open(filepath, "r", encoding="utf-8", errors="ignore") as f_obj:
                         head = [f_obj.readline().lower() for _ in range(50)]
@@ -2203,7 +1481,7 @@ def calculateByteBreakdown(repoDir: str) -> Dict[str, int]:
                     content_head = "".join(head)
                     found_id = None
 
-                    # Framework mapping logic
+                    
                     if ext == '.py':
                         if 'django' in content_head:
                             found_id = "Django (Python)"
@@ -2237,11 +1515,11 @@ def calculateByteBreakdown(repoDir: str) -> Dict[str, int]:
 
 
 def analyzeDocumentation(repoDir: str) -> Dict[str, Any]:
-    """Extract description and setup guidelines from README (recursive)."""
+    
     res = {"description": "N/A", "has_setup": False, "doc_quality": "Low", "env_vars": "None"}
 
     readmePath = None
-    # Scan up to depth 2 for README
+    
     for root, _, files in os.walk(repoDir):
         depth = root.replace(repoDir, "").count(os.sep)
         if depth > 2:
@@ -2262,30 +1540,30 @@ def analyzeDocumentation(repoDir: str) -> Dict[str, Any]:
                 content = f.read()
                 lines = content.splitlines()
 
-                # Simple description (first non-header paragraph)
+                
                 for line in lines:
                     clean = line.strip()
                     if clean and not clean.startswith("#"):
                         res["description"] = clean[:200] + ("..." if len(clean) > 200 else "")
                         break
-                # Setup detection
+                
                 headers = [line.lower() for line in lines if line.strip().startswith("#")]
                 if any(any(k in h for k in DOC_SETUP_KEYWORDS) for h in headers):
                     res["has_setup"] = True
 
-                # Quality heuristic (based on number of headers and length)
+                
                 if len(headers) > 5 and len(content) > 2000:
                     res["doc_quality"] = "High"
                 elif len(headers) > 2:
                     res["doc_quality"] = "Medium"
 
-                # Env vars detection
+                
                 if ".env" in content.lower() or "environment variables" in content.lower():
                     res["env_vars"] = "Detected in README"
         except Exception:
             pass
 
-    # Check for .env files
+    
     for f in os.listdir(repoDir):
         if ".env" in f.lower():
             res["env_vars"] = "Mapped (.env file present)"
@@ -2304,11 +1582,11 @@ def detectCoverage(repoDir: str) -> str:
 
 
 def estimateTestCases(fileList: List[str]) -> int:
-    """Heuristic count of test cases by scanning patterns in test files."""
+    
     count = 0
     testFiles = [f for f in fileList if "test" in f.lower() or "spec" in f.lower()]
 
-    for path in testFiles[:200]:  # Limit scan to first 200 test files for speed
+    for path in testFiles[:200]:  
         ext = path.split('.')[-1].lower()
         pattern = None
         if ext == "py":
@@ -2350,10 +1628,7 @@ def computeComplexityScore(loc: int, total_tokens: int, file_count: int) -> str:
 
 
 def detectOpenSource(repoDir: str) -> Dict[str, Any]:
-    """
-    Detect whether a repository is open-source (recursive search).
-    Checks for LICENSE files and known SPDX identifiers.
-    """
+    
     result = {
         "is_open_source": False,
         "license_file": None,
@@ -2370,11 +1645,11 @@ def detectOpenSource(repoDir: str) -> Dict[str, Any]:
 
         for f in files:
             f_lower = f.lower()
-            # README detection
+            
             if f_lower.startswith("readme"):
                 result["has_readme"] = True
 
-            # LICENSE detection
+            
             if f_lower in OPENSOURCE_LICENSE_FILES:
                 result["license_file"] = f
                 license_path = os.path.join(root, f)
@@ -2393,7 +1668,7 @@ def detectOpenSource(repoDir: str) -> Dict[str, Any]:
                     result["is_open_source"] = True
 
         if result["license_file"] and result["has_readme"]:
-            break  # Found both, can stop early
+            break  
 
     return result
 
@@ -2404,12 +1679,7 @@ def computeRepoRating(
     metricsData: Dict[str, Any],
     langData: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Stage 4 — Composite repository quality rating (0.0 – 10.0).
-
-    Combines multiple signals with weighted criteria to produce an overall rating and label.
-    Also checks if minimum thresholds are met for basic health.
-    """
+    
     signals = stage1Signals.get("signals", {})
     structure = stage1Signals.get("structure", {})
     loc = metricsData.get("loc", {}).get("value", 0) or metricsData.get("loc", {}).get("total", 0)
@@ -2433,17 +1703,17 @@ def computeRepoRating(
     scores["has_tests"] = 1.0 if signals.get("hasTests") else 0.0
     scores["has_ci"] = 1.0 if signals.get("hasCI") else 0.0
 
-    # Test file count approximation via stage1 structure (count test-named files)
+    
     test_file_count = structure.get("test_file_count", 0)
     scores["test_file_count"] = _score(test_file_count, "test_file_count")
-    # Source file ratio
+    
     total_files = structure.get("files", 0)
     lang_files_total = sum(
         v["files"] for v in langData.get("breakdown", {}).values()
     )
     src_ratio = lang_files_total / total_files if total_files > 0 else 0.0
     scores["source_file_ratio"] = _score(src_ratio, "source_file_ratio")
-    # Weighted total
+    
     weighted = sum(
         scores[k] * RATING_CRITERIA[k]["weight"]
         for k in scores
@@ -2470,10 +1740,7 @@ def computeRepoRating(
 
 
 def scanSecrets(fileList: List[str]) -> Dict[str, Any]:
-    """
-    Stage 5 — Basic credential / secret scanning.
-    Uses regex patterns to detect potential secrets in text-based files.`
-    """
+    
     findings: List[Dict[str, str]] = []
     scanned = 0
 
@@ -2481,13 +1748,13 @@ def scanSecrets(fileList: List[str]) -> Dict[str, Any]:
         ext = os.path.splitext(fp)[1].lower()
         name = os.path.basename(fp).lower()
 
-        # Only scan text-based source files likely to contain secrets
+        
         if ext not in SECRET_SCAN_EXTENSIONS and name not in {".env", "secrets"}:
             if ext in SECRET_SCAN_SKIP or ext not in CODE_EXTENSIONS:
                 continue
 
         try:
-            if os.path.getsize(fp) > 500_000:   # skip files > 500KB
+            if os.path.getsize(fp) > 500_000:   
                 continue
             with open(fp, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
@@ -2518,16 +1785,13 @@ def scanSecrets(fileList: List[str]) -> Dict[str, Any]:
 
 
 def extractGitLabRepoInfo(targetDir: str, inputTarget: str) -> Optional[Tuple[str, str, str]]:
-    """
-    Detect GitLab domain, project path, and project name from inputTarget URL or local git configuration.
-    Returns: (domain, project_path, project_name)
-    """
+    
     import urllib.parse
     for candidate in [inputTarget, targetDir]:
         if not candidate:
             continue
             
-        # 1. Handle HTTP/HTTPS URLs (including ones with embedded oauth2 tokens/passwords)
+        
         if candidate.startswith("http://") or candidate.startswith("https://"):
             try:
                 parsed = urllib.parse.urlparse(candidate)
@@ -2541,7 +1805,7 @@ def extractGitLabRepoInfo(targetDir: str, inputTarget: str) -> Optional[Tuple[st
             except Exception:
                 pass
                 
-        # 2. Handle SSH and other Git URL formats (e.g. git@gitlab.com:org/repo.git)
+        
         else:
             if "gitlab" in candidate.lower():
                 if "@" in candidate:
@@ -2558,7 +1822,7 @@ def extractGitLabRepoInfo(targetDir: str, inputTarget: str) -> Optional[Tuple[st
                     name = path.split("/")[-1]
                     return domain, path, name
 
-    # Check git config remote origin
+    
     if os.path.isdir(os.path.join(targetDir, ".git")):
         remote_url = runGit(["config", "--get", "remote.origin.url"], targetDir)
         if remote_url:
@@ -2567,9 +1831,7 @@ def extractGitLabRepoInfo(targetDir: str, inputTarget: str) -> Optional[Tuple[st
 
 
 def callGitLabApi(url: str, headers: dict, params: dict = None) -> Optional[Any]:
-    """
-    Executes a GitLab API request with rate limit handling and retries.
-    """
+    
     import requests
     retries = 0
     max_retries = 5
@@ -2602,9 +1864,7 @@ def callGitLabApi(url: str, headers: dict, params: dict = None) -> Optional[Any]
 
 
 def fetchGitLabMergeRequests(domain: str, project_path: str, token: Optional[str]) -> List[Dict[str, Any]]:
-    """
-    Fetch all Merge Requests for the repository using GitLab API, paginating.
-    """
+    
     import urllib.parse
     mr_list = []
     logger.info("Fetching GitLab Merge Requests...")
@@ -2683,9 +1943,7 @@ def runGitLabMrAnalysis(
     token: Optional[str],
     outputDir: str,
 ) -> Dict[str, Any]:
-    """
-    GitLab MR analytics module (Stage 0.5/Enrichment stage).
-    """
+    
     defaults = {
         "total_pr_count": 0,
         "open_pr_count": 0,
@@ -2743,9 +2001,7 @@ def enrichViaGitLabApi(
     project_path: str,
     token: Optional[str],
 ) -> Dict[str, Any]:
-    """
-    Optional GitLab API enrichment.
-    """
+    
     import urllib.parse
     headers = {}
     if token:
@@ -2805,18 +2061,14 @@ def enrichViaGitLabApi(
         return {"available": False, "reason": str(exc)}
 
 def extractBitbucketRepoInfo(targetDir: str, inputTarget: str) -> Optional[Tuple[str, str, str, bool]]:
-    """
-    Detect Bitbucket domain, workspace/project, and repo slug from inputTarget URL
-    or local git configuration.
-    Returns: (domain, workspace_or_project, repo_slug, is_cloud)
-    """
+    
     import urllib.parse
 
     for candidate in [inputTarget, targetDir]:
         if not candidate:
             continue
 
-        # 1. Handle HTTP/HTTPS URLs (including ones with embedded tokens/passwords)
+        
         if candidate.startswith("http://") or candidate.startswith("https://"):
             try:
                 parsed = urllib.parse.urlparse(candidate)
@@ -2827,9 +2079,9 @@ def extractBitbucketRepoInfo(targetDir: str, inputTarget: str) -> Optional[Tuple
                     if path.endswith(".git"):
                         path = path[:-4]
 
-                    # Bitbucket Server/Data Center paths look like:
-                    #   scm/PROJECT/repo.git
-                    #   projects/PROJECT/repos/repo/browse
+                    
+                    
+                    
                     path = re.sub(r"^scm/", "", path)
                     path = re.sub(r"^projects/([^/]+)/repos/([^/]+).*$", r"\1/\2", path)
 
@@ -2841,9 +2093,9 @@ def extractBitbucketRepoInfo(targetDir: str, inputTarget: str) -> Optional[Tuple
             except Exception:
                 pass
 
-        # 2. Handle SSH and other Git URL formats
-        #    Cloud:  git@bitbucket.org:workspace/repo.git
-        #    Server: ssh://git@bitbucket.company.com:7999/PROJECT/repo.git
+        
+        
+        
         else:
             if "bitbucket" in candidate.lower():
                 try:
@@ -2856,15 +2108,15 @@ def extractBitbucketRepoInfo(targetDir: str, inputTarget: str) -> Optional[Tuple
                     else:
                         host_and_path = stripped
 
-                    # host_and_path is one of:
-                    #   bitbucket.org:workspace/repo.git
-                    #   bitbucket.company.com:7999/PROJECT/repo.git
+                    
+                    
+                    
                     m = re.split(r'[:/]', host_and_path, 1)
                     if len(m) == 2:
                         domain = m[0]
                         rest = m[1]
 
-                        # Strip a leading port number if present (server SSH URLs)
+                        
                         rest = re.sub(r'^\d+/', '', rest)
 
                         if rest.endswith(".git"):
@@ -2881,7 +2133,7 @@ def extractBitbucketRepoInfo(targetDir: str, inputTarget: str) -> Optional[Tuple
                 except Exception:
                     pass
 
-    # 3. Check git config remote origin as a fallback
+    
     if os.path.isdir(os.path.join(targetDir, ".git")):
         remote_url = runGit(["config", "--get", "remote.origin.url"], targetDir)
         if remote_url:
@@ -2890,12 +2142,7 @@ def extractBitbucketRepoInfo(targetDir: str, inputTarget: str) -> Optional[Tuple
     return None
 
 def _bitbucketAuthHeaders(token: Optional[str], is_cloud: bool) -> dict:
-    """
-    Builds auth headers for Bitbucket API calls.
-    Cloud: Bearer token (Repository/Workspace access token) works for both
-           read scopes; falls back to no auth for public repos.
-    Server/Data Center: Bearer token (Personal Access Token).
-    """
+    
     headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -2903,9 +2150,7 @@ def _bitbucketAuthHeaders(token: Optional[str], is_cloud: bool) -> dict:
 
 
 def callBitbucketApi(url: str, headers: dict, params: dict = None) -> Optional[Any]:
-    """
-    Executes a Bitbucket API request with rate limit handling and retries.
-    """
+    
     import requests
     retries = 0
     max_retries = 5
@@ -2947,11 +2192,7 @@ def enrichViaBitbucketApi(
     token: Optional[str],
     is_cloud: bool,
 ) -> Dict[str, Any]:
-    """
-    Optional Bitbucket API enrichment. Branches between Bitbucket Cloud (API v2.0)
-    and Bitbucket Server/Data Center (REST API 1.0), which have different
-    endpoints, auth, and response shapes.
-    """
+    
     import urllib.parse
     headers = _bitbucketAuthHeaders(token, is_cloud)
 
@@ -2991,15 +2232,15 @@ def enrichViaBitbucketApi(
                 "description":     data.get("description"),
                 "is_private":      data.get("is_private", False),
                 "is_fork":         data.get("parent") is not None,
-                "stars":           None,   # Bitbucket Cloud has no star count
-                "forks":           None,   # requires separate /forks endpoint
-                "open_issues":     None,   # requires separate /issues endpoint
-                "topics":          [],     # Bitbucket has no topics/tags concept
+                "stars":           None,   
+                "forks":           None,   
+                "open_issues":     None,   
+                "topics":          [],     
                 "default_branch":  (data.get("mainbranch") or {}).get("name"),
                 "created_at":      created_at_str,
                 "pushed_at":       pushed_at_str,
                 "size_kb":         size_kb,
-                "license":         None,   # not exposed by the repo endpoint
+                "license":         None,   
                 "language":        data.get("language"),
                 "subscribers":     None,
                 "visibility":      "private" if data.get("is_private") else "public",
@@ -3008,7 +2249,7 @@ def enrichViaBitbucketApi(
             return {"available": False, "reason": str(exc)}
 
     else:
-        # Bitbucket Server / Data Center — REST API 1.0
+        
         encoded_project = urllib.parse.quote(workspace, safe="")
         encoded_repo = urllib.parse.quote(repo, safe="")
         url = f"https://{domain}/rest/api/1.0/projects/{encoded_project}/repos/{encoded_repo}"
@@ -3043,9 +2284,9 @@ def enrichViaBitbucketApi(
                 "open_issues":     None,
                 "topics":          [],
                 "default_branch":  default_branch,
-                "created_at":      "N/A",   # not exposed by Server API
+                "created_at":      "N/A",   
                 "pushed_at":       "N/A",
-                "size_kb":         None,    # requires separate size endpoint
+                "size_kb":         None,    
                 "license":         None,
                 "language":        None,
                 "subscribers":     None,
@@ -3062,11 +2303,7 @@ def fetchBitbucketPullRequests(
     token: Optional[str],
     is_cloud: bool,
 ) -> List[Dict[str, Any]]:
-    """
-    Fetch all Pull Requests for the repository using the Bitbucket API, paginating.
-    Cloud and Server differ significantly in pagination and state filtering,
-    so this branches on is_cloud.
-    """
+    
     import urllib.parse
     pr_list = []
     headers = _bitbucketAuthHeaders(token, is_cloud)
@@ -3077,8 +2314,8 @@ def fetchBitbucketPullRequests(
         encoded_repo = urllib.parse.quote(repo, safe="")
         base_url = f"https://api.bitbucket.org/2.0/repositories/{encoded_workspace}/{encoded_repo}/pullrequests"
 
-        # Bitbucket Cloud doesn't support state=ALL in one call — must query
-        # each state separately and merge the results.
+        
+        
         for state in ("OPEN", "MERGED", "DECLINED", "SUPERSEDED"):
             url = base_url
             params = {"state": state, "pagelen": 50}
@@ -3127,12 +2364,12 @@ def fetchBitbucketPullRequests(
                     })
                     pr_list.append(pr_dict)
 
-                # Cloud pagination gives a full "next" URL directly
+                
                 url = data.get("next")
-                params = None  # already encoded in the next URL
+                params = None  
 
     else:
-        # Bitbucket Server / Data Center — REST API 1.0, start/limit pagination
+        
         encoded_project = urllib.parse.quote(workspace, safe="")
         encoded_repo = urllib.parse.quote(repo, safe="")
         url = f"https://{domain}/rest/api/1.0/projects/{encoded_project}/repos/{encoded_repo}/pull-requests"
@@ -3151,7 +2388,7 @@ def fetchBitbucketPullRequests(
                 break
 
             for pr in values:
-                state = pr.get("state")  # OPEN, MERGED, DECLINED
+                state = pr.get("state")  
                 lifecycle_status = "open" if state == "OPEN" else ("merged" if state == "MERGED" else "closed")
 
                 created_ms = pr.get("createdDate")
@@ -3211,9 +2448,7 @@ def runBitbucketPrAnalysis(
     token: Optional[str],
     outputDir: str,
 ) -> Dict[str, Any]:
-    """
-    Bitbucket PR analytics module (Stage 0.5/Enrichment stage).
-    """
+    
     defaults = {
         "total_pr_count": 0,
         "open_pr_count": 0,
@@ -3273,9 +2508,7 @@ def runBitbucketPrAnalysis(
         return defaults
 
 def extractGitHubRepoInfo(targetDir: str, inputTarget: str) -> Optional[Tuple[str, str]]:
-    """
-    Detect GitHub repository owner and name from inputTarget URL or local git configuration.
-    """
+    
     for candidate in [inputTarget, targetDir]:
         if candidate:
             m = re.search(r"github\.com[/:]([^/]+)/([^/]+)", candidate)
@@ -3286,7 +2519,7 @@ def extractGitHubRepoInfo(targetDir: str, inputTarget: str) -> Optional[Tuple[st
                     repo = repo[:-4]
                 return owner, repo
 
-    # If not found directly, check git config remote origin
+    
     if os.path.isdir(os.path.join(targetDir, ".git")):
         remote_url = runGit(["config", "--get", "remote.origin.url"], targetDir)
         if remote_url:
@@ -3301,10 +2534,7 @@ def extractGitHubRepoInfo(targetDir: str, inputTarget: str) -> Optional[Tuple[st
 
 
 def getCoreRateLimit(g: Github):
-    """
-    Safely get the core rate limit object from Github instance,
-    supporting different PyGithub versions.
-    """
+    
     try:
         rate_limit = g.get_rate_limit()
         if hasattr(rate_limit, "resources") and hasattr(rate_limit.resources, "core"):
@@ -3319,9 +2549,7 @@ def getCoreRateLimit(g: Github):
 
 
 def handleRateLimit(g: Github, minimum_remaining: int = 10):
-    """
-    Checks the current GitHub rate limit and sleeps if it is close to exhausted.
-    """
+    
     core = getCoreRateLimit(g)
     if core is None:
         return
@@ -3344,9 +2572,7 @@ def handleRateLimit(g: Github, minimum_remaining: int = 10):
 
 
 def callWithRetry(g: Github, func, *args, max_retries=5, **kwargs):
-    """
-    Executes a PyGithub function with rate limit checks and retries.
-    """
+    
     retries = 0
     backoff = 2
     while retries < max_retries:
@@ -3379,9 +2605,7 @@ def callWithRetry(g: Github, func, *args, max_retries=5, **kwargs):
 
 
 def fetchPullRequests(g: Github, repo) -> List[Dict[str, Any]]:
-    """
-    Fetch all PRs for the repository using PyGithub, paginating and handling rate limits.
-    """
+    
     pr_list = []
     logger.info("Fetching GitHub Pull Requests...")
 
@@ -3391,7 +2615,7 @@ def fetchPullRequests(g: Github, repo) -> List[Dict[str, Any]]:
     if core is not None:
         remaining = core.remaining
     else:
-        remaining = 5000  # Default fallback
+        remaining = 5000  
 
     logger.info(f"Initial GitHub API rate limit: {remaining} remaining")
 
@@ -3428,8 +2652,8 @@ def fetchPullRequests(g: Github, repo) -> List[Dict[str, Any]]:
             "target_branch": getattr(getattr(pr, "base", None), "ref", None),
         })
 
-        # Avoid one extra API request per PR here. Content enrichment below
-        # fetches only the data needed for token counting, concurrently.
+        
+        
         pr_dict.update({
             "additions": pr_dict.get("additions"),
             "deletions": pr_dict.get("deletions"),
@@ -3445,16 +2669,12 @@ def fetchPullRequests(g: Github, repo) -> List[Dict[str, Any]]:
 
 
 def getPrVelocityMergedAt(pr):
-    """Select the oldest valid Merged At date in any provider's description.
-
-    Fall back to the API date only when no Merged At label is present. An
-    invalid original date must not silently become the migration's merge date.
-    """
+    
     dates = []
     found_label = False
     for field in ("body", "description"):
         description = str(pr.get(field) or "")
-        # Support plain text, Markdown emphasis/code, and HTML metadata labels.
+        
         description = re.sub(r"<[^>]+>", "", description)
         description = description.replace("&nbsp;", " ")
         description = re.sub(r"[*_`]", "", description)
@@ -3475,12 +2695,7 @@ def getPrVelocityMergedAt(pr):
 
 
 def calculate_pr_velocity_profile(prs):
-    """Calculate 1-week and 1-month PR velocity percentages and blacklist status.
-
-    Only merged PRs are considered, both for the total (denominator) and for
-    the recent-activity counts. Recency uses the oldest valid Merged At date in
-    each PR's body/description, falling back to the API merged_at when absent.
-    """
+    
     merged_prs = [pr for pr in prs if getPrLifecycleStatus(pr) == "merged"]
 
     if not merged_prs:
@@ -3520,9 +2735,7 @@ def calculate_pr_velocity_profile(prs):
 
 
 def calculatePrMetrics(prs: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Calculate PR counts based on the retrieved PR list.
-    """
+    
     total_pr_count = len(prs)
     open_pr_count = 0
     closed_pr_count = 0
@@ -3552,7 +2765,7 @@ def calculatePrMetrics(prs: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def buildMergeCommitIdentities(prs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """Build SHA/PR-number lookups for provider usernames on merge commits."""
+    
     bySha = {}
     byNumber = {}
     for pr in prs:
@@ -3579,7 +2792,7 @@ def buildMergeCommitIdentities(prs: List[Dict[str, Any]]) -> Dict[str, Dict[str,
 def attachMergeCommitUsernames(
     commits: List[Dict[str, Any]], identities: Dict[str, Dict[str, Any]]
 ) -> None:
-    """Attach API username without replacing immutable Git author metadata."""
+    
     bySha = identities.get("by_sha", {})
     byNumber = identities.get("by_number", {})
     prPattern = re.compile(r"\b(?:pull request|merge request)\s*[#!](\d+)\b", re.IGNORECASE)
@@ -3606,10 +2819,7 @@ def attachMergeCommitUsernames(
 
 
 def normalizeCommitAuthorsToUsernames(commits: List[Dict[str, Any]]) -> None:
-    """
-    Make ``author`` a username consistently using aliases observed for the same
-    Git email. Preserve the original Git display name in ``author_name``.
-    """
+    
     usernamePattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     candidatesByEmail = defaultdict(lambda: defaultdict(int))
 
@@ -3630,8 +2840,8 @@ def normalizeCommitAuthorsToUsernames(commits: List[Dict[str, Any]]) -> None:
         resolvedUsername = canonicalByEmail.get(email)
         if not resolvedUsername and usernamePattern.fullmatch(originalAuthor):
             resolvedUsername = originalAuthor
-        # A PR author's username is a different identity and must not be used
-        # as the merge commit author's username.
+        
+        
         commit["pr_author_username"] = commit.pop("username", "")
         commit["author"] = resolvedUsername or ""
         commit["author_identity_source"] = (
@@ -3645,7 +2855,7 @@ def _emptyPrTokenMetrics() -> Dict[str, int]:
 
 
 def countPrMetadataTokens(prs: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Count provider-supplied PR title/body text without additional requests."""
+    
     llm = _emptyPrTokenMetrics()
     lexical = _emptyPrTokenMetrics()
     for pr in prs:
@@ -3664,7 +2874,7 @@ def _addPrContentTokens(
     prs: List[Dict[str, Any]],
     detailsByNumber: Dict[Any, Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Attach fetched provider content and count it once for both tokenizers."""
+    
     llm = _emptyPrTokenMetrics()
     lexical = _emptyPrTokenMetrics()
     detailedCount = 0
@@ -3718,7 +2928,7 @@ def _addPrContentTokens(
 
 
 def countUnifiedDiffChanges(diffText: str) -> Tuple[int, int]:
-    """Count added/removed content lines while excluding diff file headers."""
+    
     additions = 0
     deletions = 0
     for line in (diffText or "").splitlines():
@@ -3734,7 +2944,7 @@ def countUnifiedDiffChanges(diffText: str) -> Tuple[int, int]:
 def enrichGitLabPrContentTokens(
     prs: List[Dict[str, Any]], domain: str, projectPath: str, token: Optional[str]
 ) -> Dict[str, Any]:
-    """Fetch GitLab MR discussions and commit messages with bounded parallel I/O."""
+    
     import urllib.parse
     headers = {"PRIVATE-TOKEN": token} if token else {}
     encodedProject = urllib.parse.quote_plus(projectPath)
@@ -3830,7 +3040,7 @@ def enrichBitbucketPrContentTokens(
     prs: List[Dict[str, Any]], domain: str, workspace: str, repoName: str,
     token: Optional[str], isCloud: bool,
 ) -> Dict[str, Any]:
-    """Fetch Bitbucket PR comments/review comments and commit messages."""
+    
     import urllib.parse
     headers = _bitbucketAuthHeaders(token, isCloud)
     encodedWorkspace = urllib.parse.quote(workspace, safe="")
@@ -3975,7 +3185,7 @@ def enrichBitbucketPrContentTokens(
 def enrichGitHubPrContentTokens(
     g: Github, repo, prs: List[Dict[str, Any]], outputDir: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Retain GitHub PR details and count the same content retained for GitLab."""
+    
     llm = _emptyPrTokenMetrics()
     lexical = _emptyPrTokenMetrics()
 
@@ -4068,7 +3278,7 @@ def enrichGitHubPrContentTokens(
                 "additions": raw.get("additions", objectValue(item, "additions", 0)),
                 "deletions": raw.get("deletions", objectValue(item, "deletions", 0)),
                 "changes": raw.get("changes", objectValue(item, "changes", 0)),
-                # GitHub omits this for binary files and may truncate very large patches.
+                
                 "patch": raw.get("patch") or objectValue(item, "patch"),
                 "sha": raw.get("sha") or objectValue(item, "sha"),
             })
@@ -4113,7 +3323,7 @@ def enrichGitHubPrContentTokens(
         return {str(key).lower(): value for key, value in headers.items()}
 
     def retryWaitSeconds(exc: Exception, attempt: int) -> float:
-        """Use GitHub's headers for primary/secondary limits, then back off safely."""
+        
         headers = exceptionHeaders(exc)
         retryAfter = headers.get("retry-after")
         if retryAfter is not None:
@@ -4130,7 +3340,7 @@ def enrichGitHubPrContentTokens(
             except (TypeError, ValueError):
                 pass
 
-        # GitHub recommends waiting at least a minute for a secondary limit.
+        
         return min(15 * 60, 60 * (2 ** attempt)) + random.uniform(1.0, 5.0)
 
     def fetchDetailsWithRetry(number: int) -> Tuple[int, Dict[str, Any]]:
@@ -4191,9 +3401,9 @@ def enrichGitHubPrContentTokens(
     prsByNumber = {pr.get("number"): pr for pr in prs if pr.get("number") is not None}
     detailed_count = 0
     failedNumbers = []
-    # GitHub recommends serial requests to avoid secondary rate limits. A large
-    # repository can require several API calls per PR, so parallel workers can
-    # trigger a 403 even when the primary hourly quota is still available.
+    
+    
+    
     for index, number in enumerate(numbers, 1):
         try:
             pr = prsByNumber.get(number)
@@ -4201,8 +3411,8 @@ def enrichGitHubPrContentTokens(
             details = loadCachedDetails(number, updatedAt)
             fromCheckpoint = details is not None
             if details is None:
-                # Check periodically rather than spending another API request for
-                # every PR. The exception path still reacts immediately to limits.
+                
+                
                 if index == 1 or index % 25 == 0:
                     handleRateLimit(g, minimum_remaining=100)
                 _, details = fetchDetailsWithRetry(number)
@@ -4253,8 +3463,8 @@ def enrichGitHubPrContentTokens(
             if index % 25 == 0:
                 logger.info(f"Enriched {index}/{len(numbers)} GitHub PRs...")
             if not fromCheckpoint:
-                # A small jitter prevents a predictable burst pattern and greatly
-                # reduces the chance of GitHub's secondary rate limit firing.
+                
+                
                 time.sleep(random.uniform(1.0, 2.0))
         except Exception as exc:
             failedNumbers.append(number)
@@ -4272,12 +3482,12 @@ def enrichGitHubPrContentTokens(
 
 
 def sanitizeFilename(name: str) -> str:
-    """Sanitize the repository name to make it OS-safe."""
+    
     return re.sub(r"[^a-zA-Z0-9_\-]", "_", name)
 
 
 def getPrLifecycleStatus(pr: Dict[str, Any]) -> str:
-    """Return one mutually-exclusive, provider-neutral PR lifecycle state."""
+    
     explicit = str(pr.get("lifecycle_status") or "").lower()
     if explicit in {"open", "merged", "closed"}:
         return explicit
@@ -4319,7 +3529,7 @@ GITLAB_ONLY_PR_FIELDS = {
 
 
 def normalizeGithubPrToGitLabSchema(pr: Dict[str, Any]) -> Dict[str, Any]:
-    """Return only GitLab-schema fields, populated with GitHub equivalents where available."""
+    
     number = pr.get("number")
     base = pr.get("base") or {}
     head = pr.get("head") or {}
@@ -4408,7 +3618,7 @@ def normalizeGithubPrToGitLabSchema(pr: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def removeUnwantedUrlFields(value: Any) -> Any:
-    """Recursively retain only exact `url` and `html_url` URL fields."""
+    
     if isinstance(value, list):
         return [removeUnwantedUrlFields(item) for item in value]
     if not isinstance(value, dict):
@@ -4422,9 +3632,7 @@ def removeUnwantedUrlFields(value: Any) -> Any:
 
 
 def dumpPrJsonFiles(outputDir: str, sanitizedRepoName: str, prs: List[Dict[str, Any]]):
-    """
-    Dump all, open, closed, and merged PR lists into JSON files in outputDir.
-    """
+    
     os.makedirs(outputDir, exist_ok=True)
 
     outputPrs = []
@@ -4457,7 +3665,7 @@ def dumpPrJsonFiles(outputDir: str, sanitizedRepoName: str, prs: List[Dict[str, 
 def addGrandTokenCountsToPrJsonFiles(
     outputDir: str, llmPrs: int, lexicalPrs: int,
 ):
-    """Write one file-level token summary aligned with the summary CSV values."""
+    
     if not os.path.isdir(outputDir):
         return
 
@@ -4518,7 +3726,7 @@ def dumpCommitsCsv(outputDir: str, sanitizedRepoName: str, commits: List[Dict[st
 
 
 def dumpJson(filepath: str, payload: Any) -> None:
-    """Atomically write a JSON extraction artifact."""
+    
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     tempPath = f"{filepath}.tmp"
     with open(tempPath, "w", encoding="utf-8") as handle:
@@ -4528,7 +3736,7 @@ def dumpJson(filepath: str, payload: Any) -> None:
 
 def extractLocalHistoryAndAutomation(repoDir: str, outputDir: str, repoName: str,
                                      commits: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Export fetched Git refs plus test/CI definitions and retained reports."""
+    
     branchesRaw = runGit(["for-each-ref", "--format=%(refname:short)%09%(objectname)",
                           "refs/heads", "refs/remotes"], repoDir, timeout=300) or ""
     tagsRaw = runGit(["for-each-ref", "--format=%(refname:short)%09%(objectname)%09%(creatordate:iso-strict)",
@@ -4627,7 +3835,7 @@ def extractLocalHistoryAndAutomation(repoDir: str, outputDir: str, repoName: str
 
 
 def calculatePrCommentMetrics(prs: List[Dict[str, Any]]) -> Dict[str, int]:
-    """Return general and review-comment totals split by PR lifecycle."""
+    
     metrics = {
         "total_pr_comments_count": 0,
         "open_pr_comments_count": 0,
@@ -4651,7 +3859,7 @@ def calculatePrCommentMetrics(prs: List[Dict[str, Any]]) -> Dict[str, int]:
 
 
 def extractGitHubIssuesAndCi(repo: Any, outputDir: str, repoName: str) -> Dict[str, Any]:
-    """Extract issue collaboration history and retained Actions/check metadata."""
+    
     safeName = sanitizeFilename(repoName)
     issues = []
     issueErrors = []
@@ -4726,7 +3934,7 @@ def extractGitHubIssuesAndCi(repo: Any, outputDir: str, repoName: str) -> Dict[s
 
 def extractGitLabIssuesAndCi(domain: str, projectPath: str, token: Optional[str],
                              outputDir: str, repoName: str) -> Dict[str, Any]:
-    """Extract GitLab issues, notes, pipelines and jobs when accessible."""
+    
     import urllib.parse
     headers = {"PRIVATE-TOKEN": token} if token else {}
     encoded = urllib.parse.quote_plus(projectPath)
@@ -4794,7 +4002,7 @@ def extractGitLabIssuesAndCi(domain: str, projectPath: str, token: Optional[str]
 def extractBitbucketIssuesAndCi(domain: str, workspace: str, repoName: str,
                                 token: Optional[str], isCloud: bool,
                                 prs: List[Dict[str, Any]], outputDir: str) -> Dict[str, Any]:
-    """Extract Bitbucket Cloud issues/pipelines or Server build statuses."""
+    
     import urllib.parse
     headers = _bitbucketAuthHeaders(token, isCloud)
     encodedWorkspace = urllib.parse.quote(workspace, safe="")
@@ -4932,9 +4140,7 @@ def runGitHubPrAnalysis(
     token: Optional[str],
     outputDir: str,
 ) -> Dict[str, Any]:
-    """
-    GitHub PR analytics module (Stage 0.5/Enrichment stage).
-    """
+    
     defaults = {
         "total_pr_count": 0,
         "open_pr_count": 0,
@@ -4978,9 +4184,9 @@ def runGitHubPrAnalysis(
         try:
             from github import Auth
             auth = Auth.Token(final_token)
-            # Centralize rate-limit handling below. PyGithub's default retry
-            # layer can otherwise sleep internally before our checkpoint/retry
-            # logic gets a chance to inspect GitHub's response headers.
+            
+            
+            
             g = Github(auth=auth, retry=None)
         except (ImportError, AttributeError):
             g = Github(final_token, retry=None)
@@ -5012,11 +4218,7 @@ def enrichViaGithubApi(
     repoUrl: str,
     token: Optional[str],
 ) -> Dict[str, Any]:
-    """
-    Optional GitHub API enrichment (requires PyGithub + valid token for private repos).
-    Fetches: open/closed status, stars, forks, topics, description, visibility,
-    subscriber count, default branch, and whether repo was ever public.
-    """
+    
     if not HAS_PYGITHUB:
         return {"available": False, "reason": "PyGithub not installed"}
     if not token:
@@ -5051,7 +4253,7 @@ def enrichViaGithubApi(
             "size_kb":         repo.size,
             "license":         (repo.license.spdx_id if repo.license else None),
             "language":        repo.language,
-            "subscribers":     repo.subscribers_count,  # Watchers
+            "subscribers":     repo.subscribers_count,  
             "visibility":      "private" if repo.private else "public",
         }
     except Exception as exc:
@@ -5065,9 +4267,7 @@ def saveReport(
     outputRootDir: str,
     isUrl: bool
 ) -> str:
-    """
-    Save analysis report to JSON and generate two separate summary CSVs.
-    """
+    
     absRepo = os.path.abspath(repoPath)
     repoName = os.path.basename(absRepo)
 
@@ -5094,11 +4294,11 @@ def saveReport(
     allFwFound = set()
     for fw_list in he.get("frameworks", {}).values():
         for fw in fw_list:
-            # Normalize to formal name if known, otherwise keep as is
+            
             normFw = FORMAL_FRAMEWORK_NAMES.get(fw.lower(), fw)
             allFwFound.add(normFw)
 
-    # Case-insensitive deduplication for the final sets
+    
     def _dedupe_fws(fws, category_set):
         seen_lower = set()
         unique_fws = []
@@ -5122,7 +4322,7 @@ def saveReport(
     sec_count = tm.get("secrets", {}).get("findings_count", 0)
     sec_status = "Clean" if tm.get("secrets", {}).get("clean", True) else f"Review Required ({sec_count})"
 
-    # Note: Recalculated lang percent is not used directly since byte percent is output below
+    
 
     byte_breakdown = reportData.get("heuristics", {}).get("byte_breakdown", {})
     consolidatedLangs = defaultdict(int)
@@ -5154,7 +4354,7 @@ def saveReport(
         lang_pcts.sort(key=lambda x: x[1], reverse=True)
         langBytePctStr = " | ".join([f"{name} ({pct:.1f}%)" for name, pct in lang_pcts]) or "None > 5%"
 
-    # Process Framework %
+    
     totalFwBytes = sum(consolidatedFws.values())
     fwBytePctStr = "N/A"
     if totalFwBytes > 0:
@@ -5371,7 +4571,7 @@ def saveReport(
     }
 
     reportData["full_report_snapshot"] = {
-        **all_row,  # Include everything currently in all_row
+        **all_row,  
         "deployment_env":     "|".join(infra.get("deployment", [])),
         "environment_variables": doc.get("env_vars", "N/A"),
         "stars":              gh.get("stars", "N/A"),
@@ -5561,16 +4761,16 @@ def saveReport(
         "Documentation Quality": all_row.get("documentation_quality", ""),
         "Repository Rating Score": all_row.get("repo_rating_score", ""),
         "Repository Rating Label": all_row.get("repo_rating_label", "N/A"),
-        # Project-mode values are finalized after every repository belonging to
-        # the project has been evaluated. Single/batch analysis retains N/A.
+        
+        
         "Acceptance Decision": "N/A",
         "Rejection Reason": ""
     }
 
     legacyPath = os.path.join(outputRootDir, "legacy.csv")
     if os.path.isfile(legacyPath):
-        # Transparently migrate legacy.csv files created by older versions so
-        # appended rows always align with the expanded header.
+        
+        
         with CSV_LOCK:
             with open(legacyPath, "r", encoding="utf-8-sig", newline="") as f:
                 existingReader = csv.DictReader(f)
@@ -5583,13 +4783,13 @@ def saveReport(
                     if header not in retiredLegacyHeaders
                 ]
             if existingHeaders:
-                # Preserve any user-defined legacy columns and append only the
-                # fields introduced by this version.
+                
+                
                 mergedLegacyHeaders = existingHeaders + [
                     header for header in legacy_headers if header not in existingHeaders
                 ]
-                # Keep repository PR/MR comment totals immediately to the right
-                # of merged_pr_count, including when migrating an older CSV.
+                
+                
                 commentHeaders = [
                     "total_pr_comments_count", "open_pr_comments_count",
                     "closed_pr_comments_count", "merged_pr_comments_count",
@@ -5614,10 +4814,7 @@ def saveReport(
 
 
 def runInteractiveMode() -> Optional[argparse.Namespace]:
-    """
-    Guided terminal UI for configuring analysis parameters.
-    Loops until valid configuration or exit.
-    """
+    
     while True:
         print("\n" + "=" * 34)
         print("   REPOSITORY ANALYSIS TOOL")
@@ -5700,9 +4897,7 @@ def runInteractiveMode() -> Optional[argparse.Namespace]:
 
 
 def runAnalysis(args: argparse.Namespace) -> Any:
-    """
-    Execute complete analysis pipeline (Stages 0–5).
-    """
+    
     inputTarget = args.input
     requestedBranch = (getattr(args, "branch", None) or "").strip() or None
     githubToken = getattr(args, "github_token", None)
@@ -5753,12 +4948,12 @@ def runAnalysis(args: argparse.Namespace) -> Any:
                 logger.error(f"[runAnalysis] Path does not exist: {inputTarget}")
                 return False
 
-        # Strict isolation: ensure we are at the repo root or targeting a directory
+        
         if not os.path.isdir(targetDir):
             logger.error(f"[runAnalysis] Target is not a directory: {targetDir}")
             return False
 
-        # Smart Git root discovery
+        
         gitDir = os.path.join(targetDir, ".git")
         if not os.path.exists(gitDir):
             try:
@@ -5820,7 +5015,7 @@ def runAnalysis(args: argparse.Namespace) -> Any:
         }
         report["performance"]["stage0_seconds"] = round(time.time() - s0Start, 2)
 
-        # Calculate OS-safe outDir matching saveReport logic
+        
         repoName = os.path.basename(os.path.abspath(targetDir))
         if isUrl:
             safeName = inputTarget.rstrip("/").split("/")[-1].replace(".git", "")
@@ -5878,9 +5073,9 @@ def runAnalysis(args: argparse.Namespace) -> Any:
         authoredCodeFiles = authoredSccData.get("source_files", [])
         if totalSccData.get("totals") and authoredSccData.get("totals"):
             totalStats = totalSccData["totals"]
-            # This is the exact filtered SCC Code total requested by the LOC
-            # policy. Source-code tokens use the narrower source_files manifest;
-            # SCC-recognized docs/configs remain separate token categories.
+            
+            
+            
             authoredStats = authoredSccData["totals"]
             authoredLoc = authoredStats["code"]
             totalLoc = totalStats["code"]
@@ -5905,7 +5100,7 @@ def runAnalysis(args: argparse.Namespace) -> Any:
                 ),
             }
 
-            # Language analysis follows the authored/eligible SCC population.
+            
             langBreakdown = {}
             for lang, stats in authoredSccData.get("languages", {}).items():
                 langBreakdown[lang] = {
@@ -5914,7 +5109,7 @@ def runAnalysis(args: argparse.Namespace) -> Any:
                     "pct": round((stats["code"] / authoredLoc * 100), 2) if authoredLoc > 0 else 0
                 }
 
-            # Differentiate between core (code) and total (all) languages
+            
             coreLangs = [lang for lang in langBreakdown.keys() if lang not in NON_CORE_FORMATS]
 
             report["ground_truth"]["languages"] = {
@@ -5997,7 +5192,7 @@ def runAnalysis(args: argparse.Namespace) -> Any:
             report["heuristics"]["runtime"] = nodeRuntime
             report["tool_metrics"]["compliance"] = detectOpenSource(targetDir)
 
-            # Infrastructure, Testing & Documentation
+            
             report["heuristics"]["infrastructure"] = detectInfrastructure(targetDir)
             report["heuristics"]["byte_breakdown"] = calculateByteBreakdown(targetDir)
             report["heuristics"]["docs"] = analyzeDocumentation(targetDir)
@@ -6014,7 +5209,7 @@ def runAnalysis(args: argparse.Namespace) -> Any:
             ratingData = computeRepoRating(
                 gitData,
                 report["heuristics"],
-                report["ground_truth"],  # Pass full ground truth
+                report["ground_truth"],  
                 report["ground_truth"]["languages"],
             )
             report["heuristics"]["repo_rating"] = ratingData
@@ -6137,13 +5332,13 @@ def runAnalysis(args: argparse.Namespace) -> Any:
 
 
 def _safeOutputName(value: str) -> str:
-    """Return a stable directory-safe name for a user supplied project name."""
+    
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip()).strip("._")
     return safe or "project"
 
 
 def runProjectsAnalysis(args: argparse.Namespace) -> str:
-    """Analyze and evaluate all projects declared in a user-friendly CSV."""
+    
     from tools.project_acceptance import (
         evaluate_project,
         evaluate_repository,
@@ -6232,7 +5427,7 @@ def runProjectsAnalysis(args: argparse.Namespace) -> str:
 
 
 def main():
-    """Main entry point for the repository analysis tool."""
+    
     dotenv_path = os.path.join(os.getcwd(), ".env")
     if os.path.exists(dotenv_path):
         try:

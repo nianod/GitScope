@@ -94,7 +94,7 @@ def load_projects_csv(path: str) -> List[Dict[str, Any]]:
         if "project_name" not in headers or not target_column or "branch" not in headers:
             raise ValueError("CSV must contain project_name, repo_url, and branch columns")
 
-        # Normalize possibly oddly-cased/spaced headers from Excel.
+        
         for row_number, raw_row in enumerate(reader, start=2):
             row = {str(k).strip().lower(): (v or "").strip() for k, v in raw_row.items() if k is not None}
             project_name = row.get("project_name", "")
@@ -202,7 +202,7 @@ def normalize_repository_metrics(report: Dict[str, Any]) -> Dict[str, Any]:
 
     contributors = git.get("all_contributors", []) or []
     human_contributors = [c for c in contributors if not _is_bot(c)]
-    # Fallback preserves existing contributor information if detailed shortlog failed.
+    
     human_count = len(human_contributors) if contributors else git.get("unique_contributors")
 
     language_breakdown = gt.get("languages", {}).get("breakdown", {}) or {}
@@ -226,8 +226,8 @@ def normalize_repository_metrics(report: Dict[str, Any]) -> Dict[str, Any]:
     git_available = bool(git.get("available", report.get("is_git", False)))
     loc_available = loc_source == "scc"
 
-    # Stage-1 fileList includes docs/config; extensions lets us conservatively
-    # remove known non-source formats while retaining extensionless code files.
+    
+    
     extensions = structure.get("extensions", {}) or {}
     non_source_exts = {
         ".md", ".markdown", ".rst", ".txt", ".adoc", ".tex", ".json",
@@ -400,8 +400,8 @@ def update_legacy_acceptance(output_dir: str, project_result: Dict[str, Any]) ->
         rows = list(reader)
         fieldnames = list(reader.fieldnames or [])
     
-    # Insert Status immediately before Acceptance Decision
-    # Insert new velocity columns before Acceptance Decision
+    
+    
     for column in reversed(["pr_velocity_profile", "blacklist_status"]):
         if column not in fieldnames:
             if "Acceptance Decision" in fieldnames:
@@ -454,7 +454,7 @@ def update_legacy_acceptance(output_dir: str, project_result: Dict[str, Any]) ->
             f"Repository: {repo.get('decision', 'ANALYSIS_ERROR')} | "
             f"Project: {project_result.get('decision', 'MANUAL_REVIEW')}"
         )
-        # Extract project status from the Acceptance Decision string
+        
         project_part = row["Acceptance Decision"].split("Project:")[-1].strip().split()[0]
         row["Status"] = project_part
         row["Rejection Reason"] = "; ".join(reasons) if reasons else "All requirements passed"
@@ -522,7 +522,7 @@ def save_combined_legacy(
                 **legacy_row,
             })
 
-    # Ensure correct column order: pr_velocity_profile -> blacklist_status -> Status -> Acceptance Decision
+    
     def _ensure_column_before(fieldnames, col, before_col):
         if col not in fieldnames or before_col not in fieldnames:
             return fieldnames
