@@ -2057,6 +2057,7 @@ def enrichViaGitLabApi(
             "subscribers":     None,
             "visibility":      project.get("visibility"),
         }
+        
     except Exception as exc:
         return {"available": False, "reason": str(exc)}
 
