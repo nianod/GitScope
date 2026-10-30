@@ -56,6 +56,27 @@ Use `projects.example.csv` as the starting point for project input, or create on
 python Repo_analysis_tool.py --project-wizard
 ```
 
+## Docker
+
+Build the self-contained CLI image (Python, Git, and SCC are included):
+
+```bash
+docker build -t repository-analysis-tool .
+docker run --rm \
+  -v /path/to/repository:/workspace/target:ro \
+  -v "$(pwd)/outputs:/workspace/outputs" \
+  repository-analysis-tool \
+  --input /workspace/target --output-dir /workspace/outputs
+```
+
+With Docker Compose, set `ANALYSIS_TARGET` to the repository you want to analyze, then run:
+
+```bash
+ANALYSIS_TARGET=/path/to/repository docker compose run --rm analyzer
+```
+
+The CI workflow compiles the Python source, builds the image, and runs a CLI smoke test for every pull request and push to `main`.
+
 ### Usage
 
 Command line usage of `scc` is designed to be as simple as possible.
