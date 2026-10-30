@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Python and container image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate Python syntax
+        run: python -m compileall -q tools
+
+      - name: Build container image
+        run: docker build --tag repository-analysis-tool:ci .
+
+      - name: Smoke-test the CLI in the image
+        run: docker run --rm repository-analysis-tool:ci --help

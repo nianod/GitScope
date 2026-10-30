@@ -1,0 +1,15 @@
+services:
+  analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: repository-analysis-tool:local
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ${ANALYSIS_TARGET:-.}:/workspace/target:ro
+      - ./outputs:/workspace/outputs
+    command:
+      - --input
+      - /workspace/target
+      - --output-dir
+      - /workspace/outputs
